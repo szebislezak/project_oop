@@ -7,13 +7,22 @@ class Szoba:
         self.szobaszam = szobaszam
         self.ar = ar
 
+    def __str__(self):
+        return f"Szobaszám: {self.szobaszam}, Ár: {self.ar} Ft"
+
 class EgyagyasSzoba(Szoba):
     def __init__(self, szobaszam):
-        super().__init__(szobaszam, 50000)
+        super().__init__(szobaszam, 70000)
+
+    def __str__(self):
+        return super().__str__() + ", Típus: Egyágyas"
 
 class KetagyasSzoba(Szoba):
     def __init__(self, szobaszam):
-        super().__init__(szobaszam, 80000)
+        super().__init__(szobaszam, 130000)
+
+    def __str__(self):
+        return super().__str__() + ", Típus: Kétágyas"
 
 class Szalloda:
     def __init__(self, nev):
@@ -22,6 +31,10 @@ class Szalloda:
         self.foglalasok = []
 
     def add_szoba(self, szoba):
+        for existing_szoba in self.szobak:
+            if existing_szoba.szobaszam == szoba.szobaszam:
+                messagebox.showerror("Hiba", "Már létezik ilyen szobaszám.")
+                return
         self.szobak.append(szoba)
 
     def foglalas(self, szobaszam, datum):
@@ -31,6 +44,8 @@ class Szalloda:
 
         for szoba in self.szobak:
             if szoba.szobaszam == szobaszam:
+                if any(foglalas['szobaszam'] == szobaszam for foglalas in self.foglalasok):
+                    return "A foglalás sikertelen. A szoba már foglalt."
                 self.foglalasok.append({'szobaszam': szobaszam, 'datum': datum})
                 return szoba.ar
 
@@ -51,6 +66,15 @@ class Szalloda:
             foglalasok_str += f"Szobaszám: {foglalas['szobaszam']}, Dátum: {foglalas['datum']}\n"
         return foglalasok_str
 
+    def listaz_szobak(self):
+        szabad_szobak = [szoba for szoba in self.szobak if all(szoba.szobaszam != foglalas['szobaszam'] for foglalas in self.foglalasok)]
+        if not szabad_szobak:
+            return "Nincsenek szabad szobák."
+        szobak_str = "Szabad szobák és árak:\n"
+        for szoba in szabad_szobak:
+            szobak_str += str(szoba) + "\n"
+        return szobak_str
+
 def foglalas_callback(szalloda, szobaszam_input, datum_input, status_label):
     szobaszam = szobaszam_input.get()
     datum = datum_input.get()
@@ -60,8 +84,11 @@ def foglalas_callback(szalloda, szobaszam_input, datum_input, status_label):
             messagebox.showerror("Hiba", "Hibás dátum: csak jövőbeni foglalás lehetséges.")
             return
         ar = szalloda.foglalas(szobaszam, datum)
-        messagebox.showinfo("Foglalás", f"A foglalás sikeres. Ár: {ar}")
-        status_label.config(text="Foglalás sikeres.")
+        if isinstance(ar, str):  # Ha a foglalás sikertelen volt
+            messagebox.showerror("Hiba", ar)
+        else:  # Ha a foglalás sikeres volt
+            messagebox.showinfo("Foglalás", f"A foglalás sikeres. Ár: {ar}")
+            status_label.config(text="Foglalás sikeres.")
     except ValueError:
         messagebox.showerror("Hiba", "Hibás dátum formátum.")
 
@@ -76,24 +103,39 @@ def listaz_callback(szalloda):
     foglalasok = szalloda.listaz_foglalasok()
     messagebox.showinfo("Foglalások", foglalasok)
 
+def listaz_szobak_callback(szalloda):
+    szabad_szobak = szalloda.listaz_szobak()
+    messagebox.showinfo("Szabad szobák", szabad_szobak)
+
 def main():
     szalloda = Szalloda("Példa Szálloda")
+    szalloda.add_szoba(KetagyasSzoba("89"))
+    szalloda.add_szoba(KetagyasSzoba("90"))
+    szalloda.add_szoba(KetagyasSzoba("91"))
+    szalloda.add_szoba(KetagyasSzoba("92"))
+    szalloda.add_szoba(KetagyasSzoba("93"))
+    szalloda.add_szoba(KetagyasSzoba("94"))
+    szalloda.add_szoba(KetagyasSzoba("95"))
+    szalloda.add_szoba(KetagyasSzoba("96"))
+    szalloda.add_szoba(KetagyasSzoba("97"))
+    szalloda.add_szoba(KetagyasSzoba("98"))
+    szalloda.add_szoba(KetagyasSzoba("99"))
     szalloda.add_szoba(EgyagyasSzoba("101"))
-    szalloda.add_szoba(KetagyasSzoba("102"))
+    szalloda.add_szoba(EgyagyasSzoba("102"))
     szalloda.add_szoba(EgyagyasSzoba("103"))
-    szalloda.add_szoba(KetagyasSzoba("104"))
-    szalloda.add_szoba(KetagyasSzoba("105"))
-    szalloda.add_szoba(KetagyasSzoba("106"))
-    szalloda.add_szoba(KetagyasSzoba("107"))
-    szalloda.add_szoba(KetagyasSzoba("108"))
-    szalloda.add_szoba(KetagyasSzoba("109"))
-    szalloda.add_szoba(KetagyasSzoba("110"))
-    szalloda.add_szoba(KetagyasSzoba("111"))
-    szalloda.add_szoba(KetagyasSzoba("112"))
-    szalloda.add_szoba(KetagyasSzoba("113"))
-    szalloda.add_szoba(KetagyasSzoba("114"))
-    szalloda.add_szoba(KetagyasSzoba("115"))
-    szalloda.add_szoba(KetagyasSzoba("116"))
+    szalloda.add_szoba(EgyagyasSzoba("104"))
+    szalloda.add_szoba(EgyagyasSzoba("105"))
+    szalloda.add_szoba(EgyagyasSzoba("106"))
+    szalloda.add_szoba(EgyagyasSzoba("107"))
+    szalloda.add_szoba(EgyagyasSzoba("108"))
+    szalloda.add_szoba(EgyagyasSzoba("109"))
+    szalloda.add_szoba(EgyagyasSzoba("110"))
+    szalloda.add_szoba(EgyagyasSzoba("111"))
+    szalloda.add_szoba(EgyagyasSzoba("112"))
+    szalloda.add_szoba(EgyagyasSzoba("113"))
+    szalloda.add_szoba(EgyagyasSzoba("114"))
+    szalloda.add_szoba(EgyagyasSzoba("115"))
+    szalloda.add_szoba(EgyagyasSzoba("116"))
 
     root = tk.Tk()
     root.title("Szálloda Foglalások")
@@ -119,11 +161,14 @@ def main():
     listaz_button = tk.Button(root, text="Foglalások listázása", command=lambda: listaz_callback(szalloda), font=("Helvetica", 12))
     listaz_button.grid(row=3, column=0, columnspan=2)
 
+    listaz_szobak_button = tk.Button(root, text="Szabad szobák listázása", command=lambda: listaz_szobak_callback(szalloda), font=("Helvetica", 12))
+    listaz_szobak_button.grid(row=4, column=0, columnspan=2)
+
     exit_button = tk.Button(root, text="Kilépés", command=root.quit, font=("Helvetica", 12))
-    exit_button.grid(row=4, column=0, columnspan=2)
+    exit_button.grid(row=5, column=0, columnspan=2)
 
     status_label = tk.Label(root, text="", bd=1, relief=tk.SUNKEN, anchor=tk.W)
-    status_label.grid(row=5, column=0, columnspan=2, sticky=tk.W+tk.E)
+    status_label.grid(row=6, column=0, columnspan=2, sticky=tk.W+tk.E)
 
     root.mainloop()
 
