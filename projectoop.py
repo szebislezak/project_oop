@@ -87,7 +87,7 @@ def foglalas_callback(szalloda, szobaszam_input, datum_input, status_label):
         if isinstance(ar, str):  # Ha a foglalás sikertelen volt
             messagebox.showerror("Hiba", ar)
         else:  # Ha a foglalás sikeres volt
-            messagebox.showinfo("Foglalás", f"A foglalás sikeres. Ár: {ar}")
+            messagebox.showinfo("Foglalás", f"A foglalás sikeres. Ár: {ar} FT")
             status_label.config(text="Foglalás sikeres.")
     except ValueError:
         messagebox.showerror("Hiba", "Hibás dátum formátum.")
