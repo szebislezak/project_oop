@@ -1,14 +1,15 @@
 //+------------------------------------------------------------------+
 //| XAU "Bari mode" Signal + Auto EA (M5 entry, M15 bias)            |
 //| - TREND algo: BOS + zone from last opposite candle (LIMIT ladder)|
-//| - RANGE algo: M15 range-edge + reversal trigger (MARKET entry)   |
-//| - Bari-like: Zone 2-4$, SL buffer 7$, TP step 5$                 |
+//| - RANGE algo: TRUE range (M15) + touch-count + M5 reversal       |
+//|            -> MARKET NOW entry, TP1 targets RANGE MID            |
+//| - Bari-like: Zone 2-4$, SL buffer (trend/range separate), TP step|
 //| - TP1 always; TP2/TP3 conditional; then HOLD (no TP4)            |
 //| - Anti-spam + Quiet hours (no signals 21:30-06:00)               |
-//| - "No slip" for LIMIT: don't alert if price too far from zone    |
+//| - "No slip" only for TREND LIMIT: don't alert if too far from zone|
 //+------------------------------------------------------------------+
 #property strict
-#property description "Bari-like XAU | TREND=BOS+LIMIT ladder | RANGE=edge+reversal+MARKET | Anti-spam | Quiet hours | Telegram"
+#property description "Bari-like XAU | TREND=BOS+LIMIT ladder | RANGE=range+reversal+MARKET | Anti-spam | Quiet hours | Telegram"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
@@ -39,7 +40,7 @@ input double AntiSpamZoneTolDollars  = 1.0;     // zone similarity tolerance (in
 
 // "No slip": if current price too far from LIMIT zone, don't signal
 input bool   UseNoSlipFilter         = true;
-input double MaxDistanceFromZoneDollars = 6.0;  // if price is farther than this from zone -> skip LIMIT signal
+input double MaxDistanceFromZoneDollars = 6.0;  // if price farther than this from TREND zone -> skip
 
 // Daily cap
 input int    MaxSetupsPerDay         = 50;
@@ -60,14 +61,24 @@ input double MinBody_ATR             = 0.05;
 input double MinRange_ATR            = 0.20;
 input int    FindLastOppCandleBars   = 8;
 
-//======================== RANGE DETECTION (REAL RANGE ALGO) ========================
+//======================== RANGE DETECTION (TRUE RANGE ALGO) ========================
 // Range is defined on M15 over last N candles.
-// Trigger: price touches range edge (within tol) + M5 reversal candle (engulf/pin-ish).
-input int    RangeLookbackBars_M15   = 30;     // 20..50 is typical
-input double RangeEdgeTol_ATR15      = 0.20;   // edge proximity tolerance = ATR15 * this
-input double RangeReversalBody_ATR5  = 0.06;   // reversal candle min body (ATR5 fraction)
-input bool   RequireCloseBackInside  = true;   // after touching edge, M5 close back inside range
-input bool   UseRangeOnlyIfADXLow    = true;   // range algo only when ADX < threshold
+// Must be "good range": width within [Min..Max] ATR15 and touched both edges.
+// Trigger: price touches edge + M5 reversal candle.
+input int    RangeLookbackBars_M15     = 30;     // 20..50 typical
+input int    RangeMinTouchesPerSide    = 2;      // must touch both low and high edges at least this many times
+input double RangeEdgeTol_ATR15        = 0.20;   // edge proximity tolerance = ATR15 * this
+input double RangeMinWidth_ATR15       = 1.2;    // range width must be >= ATR15*X
+input double RangeMaxWidth_ATR15       = 4.5;    // range width must be <= ATR15*X
+
+input double RangeReversalBody_ATR5    = 0.06;   // reversal candle min body (ATR5 fraction)
+input bool   RequireCloseBackInside    = true;   // after touching edge, M5 close back inside range
+input bool   UseRangeOnlyIfADXLow      = true;   // range algo only when ADX < threshold
+
+// RANGE risk/targets (separate from TREND)
+input double Range_SLBuffer_Dollars    = 5.0;    // range SL tighter than trend by default
+input bool   RangeTP1_ToMid            = true;   // TP1 is range MID (mean reversion)
+input double RangeMidMinMove_Dollars   = 2.5;    // if MID is too close (< this), skip range signal (avoid tiny mid targets)
 
 //======================== BIAS (M15 EMA200) ========================
 input bool   UseTrendBias            = true;
@@ -379,7 +390,7 @@ Regime GetRegime()
 }
 
 //======================== MOMENTUM =========================
-double MomentumScore(double o,double h,double l,double c,double atr,bool isBuy,double bosLevel)
+double MomentumScore(double o,double h,double l,double c,double atr,bool isBuy,double refLevel)
 {
    if(atr<=0.0) return 0.0;
 
@@ -387,7 +398,7 @@ double MomentumScore(double o,double h,double l,double c,double atr,bool isBuy,d
    double range=(h-l);
    double br = (range>0.0)?(body/range):0.0;
 
-   double beyond = isBuy ? (c-bosLevel) : (bosLevel-c);
+   double beyond = isBuy ? (c-refLevel) : (refLevel-c);
    double beyondA = beyond/atr;
 
    double score=0.0;
@@ -418,6 +429,11 @@ struct Signal
    double tp2; // 0 => HOLD
    double tp3; // 0 => HOLD
    double mom;
+
+   // range debug
+   double rangeLow;
+   double rangeHigh;
+   double rangeMid;
 };
 
 string SignalText(const Signal &s)
@@ -431,12 +447,11 @@ string SignalText(const Signal &s)
    if(a>b){ double t=a; a=b; b=t; }
 
    string header = "XAUUSD ("+reg+")\n\n"+icon+" "+side+" ("+how+")";
-
-   // market: show entry price too
    if(s.isMarket && s.entryNow>0.0)
       header += " @"+DoubleToString(s.entryNow,2);
 
-   string txt = header + " " + DoubleToString(a,0) + " - " + DoubleToString(b,0) +
+   string txt = header +
+                "\n\n"+DoubleToString(a,0)+" - "+DoubleToString(b,0)+
                 "\n\nSL " + DoubleToString(s.sl,0) +
                 "\n\nTP1 " + DoubleToString(s.tp1,0);
 
@@ -445,6 +460,12 @@ string SignalText(const Signal &s)
 
    if(s.tp3>0.0) txt += "\nTP3 "+DoubleToString(s.tp3,0);
    else          txt += "\nTP3 HOLD.";
+
+   if(s.regime==REGIME_RANGE)
+   {
+      txt += "\n\nRANGE: " + DoubleToString(s.rangeLow,0) + " - " + DoubleToString(s.rangeHigh,0) +
+             "\nMID: " + DoubleToString(s.rangeMid,0);
+   }
 
    return txt;
 }
@@ -514,7 +535,6 @@ bool IsTooFarFromZone_Limit(bool isBuy, double zLow, double zHigh)
 //======================== TREND SIGNAL (BOS) =========================
 bool DetectSignalTrend(Signal &s)
 {
-   // BOS on EntryTF (M5)
    double o,h,l,c;
    if(!GetBarOHLC(EntryTF, 1, o,h,l,c)){ r_noBar++; return false; }
 
@@ -540,7 +560,6 @@ bool DetectSignalTrend(Signal &s)
    double bosLevel = isBuy ? structHigh : structLow;
    double mom = MomentumScore(o,h,l,c,atr,isBuy,bosLevel);
 
-   // bias gating for TREND algo (but not killing everything)
    int bias = TrendBias();
    if(UseTrendBias)
    {
@@ -554,7 +573,6 @@ bool DetectSignalTrend(Signal &s)
       }
    }
 
-   // zone from last opposite candle, fallback if missing
    double zL=0,zH=0;
    if(!FindOppCandleZone(isBuy, FindLastOppCandleBars, zL, zH))
    {
@@ -563,16 +581,13 @@ bool DetectSignalTrend(Signal &s)
       else     { zL=c+atr*0.15; zH=zL+width; }
    }
 
-   // normalize + clamp width to Bari
    if(zL>zH){ double t=zL; zL=zH; zH=t; }
    double w = ClampD(zH-zL, ZoneMinDollars, ZoneMaxDollars);
    if(isBuy) zL = zH - w;
    else      zH = zL + w;
 
-   // no-slip filter only for LIMIT trend entries
    if(IsTooFarFromZone_Limit(isBuy, zL, zH)){ r_far++; return false; }
 
-   // Bari SL/TP
    double sl  = isBuy ? (zL - Bari_SLBuffer_Dollars)
                       : (zH + Bari_SLBuffer_Dollars);
 
@@ -600,47 +615,69 @@ bool DetectSignalTrend(Signal &s)
    s.tp3  = (outTP3>0.0?NormalizePrice(outTP3):0.0);
    s.mom  = mom;
 
+   s.rangeLow=0; s.rangeHigh=0; s.rangeMid=0;
+
    return true;
 }
 
-//======================== RANGE SIGNAL (REAL RANGE EDGE + REVERSAL) =========================
+//======================== RANGE HELPERS =========================
 bool GetRangeM15(double &rangeLow, double &rangeHigh)
 {
-   // use last N completed M15 candles (shift starts at 1)
    rangeHigh = HighestHigh(PERIOD_M15, 1, RangeLookbackBars_M15);
    rangeLow  = LowestLow (PERIOD_M15, 1, RangeLookbackBars_M15);
    return (rangeHigh>0.0 && rangeLow>0.0 && rangeHigh>rangeLow);
 }
 
-bool IsReversalBuyM5(double rangeLow, double rangeHigh, double atr5, double edgeTol)
+int CountTouchesM15(bool countLow, double edge, double tol, int lookback)
 {
-   // Use last closed M5 candle (shift=1)
+   // count how many completed M15 candles touched edge within tol
+   int touches=0;
+   for(int sh=1; sh<=lookback; sh++)
+   {
+      double o,h,l,c;
+      if(!GetBarOHLC(PERIOD_M15, sh, o,h,l,c)) break;
+
+      if(countLow)
+      {
+         if(l <= edge + tol) touches++;
+      }
+      else
+      {
+         if(h >= edge - tol) touches++;
+      }
+   }
+   return touches;
+}
+
+bool IsReversalBuyM5(double rangeLow, double atr5, double edgeTol)
+{
    double o,h,l,c;
    if(!GetBarOHLC(PERIOD_M5,1,o,h,l,c)) return false;
 
    double body = MathAbs(c-o);
    if(body < atr5*RangeReversalBody_ATR5) return false;
 
-   // touched/near low edge
    bool touched = (l <= (rangeLow + edgeTol));
-
    if(!touched) return false;
 
-   // bullish reversal style
    bool bullish = (c>o);
+   if(RequireCloseBackInside) bullish = bullish && (c > rangeLow);
 
-   // optional close back inside range
-   if(RequireCloseBackInside)
-      bullish = bullish && (c > rangeLow);
-
-   // small pin bonus: long lower wick
    double lowerWick = MathMin(o,c) - l;
    bool pin = (lowerWick >= atr5*0.20);
+
+   // small engulf add-on
+   double o2,h2,l2,c2;
+   if(GetBarOHLC(PERIOD_M5,2,o2,h2,l2,c2))
+   {
+      bool engulf = (c>o) && (c>o2) && (o< c2);
+      if(engulf) return true;
+   }
 
    return bullish || pin;
 }
 
-bool IsReversalSellM5(double rangeLow, double rangeHigh, double atr5, double edgeTol)
+bool IsReversalSellM5(double rangeHigh, double atr5, double edgeTol)
 {
    double o,h,l,c;
    if(!GetBarOHLC(PERIOD_M5,1,o,h,l,c)) return false;
@@ -652,24 +689,29 @@ bool IsReversalSellM5(double rangeLow, double rangeHigh, double atr5, double edg
    if(!touched) return false;
 
    bool bearish = (c<o);
-
-   if(RequireCloseBackInside)
-      bearish = bearish && (c < rangeHigh);
+   if(RequireCloseBackInside) bearish = bearish && (c < rangeHigh);
 
    double upperWick = h - MathMax(o,c);
    bool pin = (upperWick >= atr5*0.20);
 
+   double o2,h2,l2,c2;
+   if(GetBarOHLC(PERIOD_M5,2,o2,h2,l2,c2))
+   {
+      bool engulf = (c<o) && (c<o2) && (o> c2);
+      if(engulf) return true;
+   }
+
    return bearish || pin;
 }
 
+//======================== RANGE SIGNAL (TRUE RANGE EDGE + REVERSAL) =========================
 bool DetectSignalRange(Signal &s)
 {
-   // only if ADX low (optional)
    if(UseRangeOnlyIfADXLow)
    {
       double adx = ADX_M15(1);
-      if(adx<=0.0) return false;
-      if(adx >= ADXTrendThreshold) return false; // not range now
+      if(adx<=0.0) { r_range++; return false; }
+      if(adx >= ADXTrendThreshold) { r_range++; return false; }
    }
 
    double rangeLow=0, rangeHigh=0;
@@ -679,56 +721,78 @@ bool DetectSignalRange(Signal &s)
    double atr5  = ATR_M5(1);
    if(atr15<=0.0 || atr5<=0.0){ r_atr++; return false; }
 
+   double width = rangeHigh - rangeLow;
+   if(width < atr15*RangeMinWidth_ATR15) { r_range++; return false; }
+   if(width > atr15*RangeMaxWidth_ATR15) { r_range++; return false; }
+
    double edgeTol = atr15 * RangeEdgeTol_ATR15;
 
-   // check reversal triggers on M5 at edges
-   bool buyTrig  = IsReversalBuyM5(rangeLow, rangeHigh, atr5, edgeTol);
-   bool sellTrig = IsReversalSellM5(rangeLow, rangeHigh, atr5, edgeTol);
+   // touch count filter: must have structure on both sides
+   int tLow  = CountTouchesM15(true,  rangeLow,  edgeTol, RangeLookbackBars_M15);
+   int tHigh = CountTouchesM15(false, rangeHigh, edgeTol, RangeLookbackBars_M15);
+   if(tLow < RangeMinTouchesPerSide || tHigh < RangeMinTouchesPerSide)
+   {
+      r_range++;
+      return false;
+   }
+
+   bool buyTrig  = IsReversalBuyM5(rangeLow, atr5, edgeTol);
+   bool sellTrig = IsReversalSellM5(rangeHigh, atr5, edgeTol);
    if(!buyTrig && !sellTrig){ r_range++; return false; }
 
    bool isBuy = buyTrig;
-   // market entry price now
+
    double bid=0, ask=0;
    if(!SymbolInfoDouble(InpSymbol,SYMBOL_BID,bid)) return false;
    if(!SymbolInfoDouble(InpSymbol,SYMBOL_ASK,ask)) return false;
    double entryNow = isBuy ? ask : bid;
 
-   // zone (for message clarity): tight 2-4$ band at touched edge
-   double w = ClampD(atr15*0.35, ZoneMinDollars, ZoneMaxDollars);
+   double mid = rangeLow + width*0.5;
+
+   // skip if mid target too close (after spread it becomes trash)
+   double distToMid = MathAbs(mid - entryNow);
+   if(RangeTP1_ToMid && distToMid < RangeMidMinMove_Dollars)
+   {
+      r_range++;
+      return false;
+   }
+
+   // zone only for display (tight band at edge)
+   double wZone = ClampD(atr15*0.35, ZoneMinDollars, ZoneMaxDollars);
    double zL=0, zH=0;
-   if(isBuy)
-   {
-      zL = rangeLow;
-      zH = rangeLow + w;
-   }
-   else
-   {
-      zH = rangeHigh;
-      zL = rangeHigh - w;
-   }
+   if(isBuy){ zL = rangeLow;  zH = rangeLow + wZone; }
+   else     { zH = rangeHigh; zL = rangeHigh - wZone; }
 
-   // SL: beyond the touched edge (Bari buffer)
-   double sl = isBuy ? (zL - Bari_SLBuffer_Dollars)
-                     : (zH + Bari_SLBuffer_Dollars);
+   // SL for range (tighter than trend by default)
+   double sl = isBuy ? (zL - Range_SLBuffer_Dollars)
+                     : (zH + Range_SLBuffer_Dollars);
 
-   // momentum for TP2/TP3 enabling (use how far last M5 close moved from edge)
-   // simple stable approximation:
+   // momentum scoring around edge (how strong reversal candle moved away)
    double o1,h1,l1,c1;
    if(!GetBarOHLC(PERIOD_M5,1,o1,h1,l1,c1)) return false;
-   double bosLevel = isBuy ? zL : zH;
-   double mom = MomentumScore(o1,h1,l1,c1,atr5,isBuy,bosLevel); // reusing same scoring
+   double refLevel = isBuy ? zL : zH;
+   double mom = MomentumScore(o1,h1,l1,c1,atr5,isBuy,refLevel);
 
-   // TP ladder from ENTRY NOW (market) so it makes sense in range
-   double tp1 = isBuy ? (entryNow + Bari_TPStep_Dollars)
-                      : (entryNow - Bari_TPStep_Dollars);
-   double tp2 = isBuy ? (tp1 + Bari_TPStep_Dollars)
-                      : (tp1 - Bari_TPStep_Dollars);
-   double tp3 = isBuy ? (tp2 + Bari_TPStep_Dollars)
-                      : (tp2 - Bari_TPStep_Dollars);
+   // RANGE targets:
+   // TP1 -> MID (mean reversion) OR fallback step
+   double tp1=0, tp2=0, tp3=0;
 
-   double outTP2 = (mom >= TP2_MinMomentum) ? tp2 : 0.0;
-   double outTP3 = (mom >= TP3_MinMomentum) ? tp3 : 0.0;
-   if(outTP2<=0.0) outTP3=0.0;
+   if(RangeTP1_ToMid)
+      tp1 = mid;
+   else
+      tp1 = isBuy ? (entryNow + Bari_TPStep_Dollars) : (entryNow - Bari_TPStep_Dollars);
+
+   // TP2 -> opposite half (closer to other edge but not exactly to avoid “edge fake”)
+   double tp2raw = isBuy ? (rangeHigh - edgeTol) : (rangeLow + edgeTol);
+   // Only enable TP2 if it is “beyond” TP1 in correct direction
+   bool tp2ok = isBuy ? (tp2raw > tp1 + 0.10) : (tp2raw < tp1 - 0.10);
+   tp2 = tp2ok ? tp2raw : 0.0;
+
+   // TP3 -> small extension past opposite edge (only if strong momentum)
+   double tp3raw = isBuy ? (rangeHigh + Bari_TPStep_Dollars) : (rangeLow - Bari_TPStep_Dollars);
+
+   double outTP2 = (mom >= TP2_MinMomentum && tp2>0.0) ? tp2 : 0.0;
+   double outTP3 = (mom >= TP3_MinMomentum && outTP2>0.0) ? tp3raw : 0.0;
 
    s.ok=true;
    s.regime=REGIME_RANGE;
@@ -742,6 +806,10 @@ bool DetectSignalRange(Signal &s)
    s.tp2  = (outTP2>0.0?NormalizePrice(outTP2):0.0);
    s.tp3  = (outTP3>0.0?NormalizePrice(outTP3):0.0);
    s.mom  = mom;
+
+   s.rangeLow=NormalizePrice(rangeLow);
+   s.rangeHigh=NormalizePrice(rangeHigh);
+   s.rangeMid=NormalizePrice(mid);
 
    return true;
 }
@@ -1009,17 +1077,14 @@ void OnTick()
    if(InCooldown()) return;
    if(InSetupPacing()) return;
 
-   // evaluate only on new M5 bar (signal generation)
    if(!NewBar(EntryTF, g_lastBarTime)) return;
 
    if(!AllowReEntry && (HasOurOpenPosition() || OrdersTotal()>0)) return;
    if(SetupsTodayCount() >= MaxSetupsPerDay) return;
 
    Regime regime = GetRegime();
-
    Signal s; s.ok=false;
 
-   // REAL: in range regime use range algo, otherwise use trend algo.
    if(regime==REGIME_RANGE)
    {
       if(!DetectSignalRange(s))
@@ -1053,24 +1118,19 @@ void OnTick()
       }
    }
 
-   // anti-spam duplicate block
    if(IsSpamDuplicate(s)){ r_spam++; return; }
 
-   // pacing
    g_nextSetupAllowed = TimeCurrent() + (datetime)(MinMinutesBetweenSetups*60);
 
-   // remember last signal
    g_lastSignalTime = TimeCurrent();
    g_lastSignalBuy  = s.isBuy;
    g_lastZLow       = s.zLow;
    g_lastZHigh      = s.zHigh;
 
-   // Telegram: instant side msg
    string regTxt = (s.regime==REGIME_RANGE ? "RANGE" : "TREND");
    string howTxt = (s.isMarket ? "NOW" : "LIMIT");
    SendTelegram("📌 ÚJ SETUP (bari)\n" + string(s.isBuy ? "BUY" : "SELL") + " ("+regTxt+"/"+howTxt+")");
 
-   // details after random delay
    int maxD = (DetailsDelaySeconds<5 ? 5 : DetailsDelaySeconds);
    int delay = 5 + (int)MathRand() % (maxD - 4);
    g_detailsSendAt = TimeCurrent() + delay;
@@ -1079,7 +1139,6 @@ void OnTick()
 
    if(!EnableAutoTrade) return;
 
-   // execute depending on signal type
    bool ok=false;
    if(s.isMarket)
       ok = PlaceRangeMarket(s);
