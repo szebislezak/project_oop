@@ -1,0 +1,726 @@
+import os
+import time
+import math
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Dict, Any, List, Tuple
+
+import numpy as np
+import pandas as pd
+
+import MetaTrader5 as mt5
+import requests
+
+from fastapi import FastAPI, Request, HTTPException
+
+
+# =========================
+# Minimal .env loader (no extra dependency)
+# =========================
+def _load_dotenv(path: str = ".env") -> None:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                os.environ.setdefault(k, v)
+    except FileNotFoundError:
+        return
+
+_load_dotenv()
+
+
+# =========================
+# CONFIG / ENV
+# =========================
+MODE = os.getenv("MODE", "LIVE").upper()  # LIVE | BACKTEST
+
+SYMBOL = os.getenv("SYMBOL", "XAUUSD.s")         # broker symbol
+DISPLAY_SYMBOL = os.getenv("DISPLAY_SYMBOL", "XAUUSD")  # telegram display only
+
+# Telegram
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_IDS = os.getenv("TELEGRAM_CHAT_IDS", "")
+TELEGRAM_DISABLE = os.getenv("TELEGRAM_DISABLE", "0") == "1"
+
+# Optional webhook secret
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+
+# Cooldown / density
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "10"))
+MIN_BARS_BETWEEN_SIGNALS = int(os.getenv("MIN_BARS_BETWEEN_SIGNALS", "1"))
+
+# HTF + Trigger TF
+HTF_TF = os.getenv("HTF_TF", "H1").upper()          # H1 or M15
+TRIGGER_TF = os.getenv("TRIGGER_TF", "M5").upper()  # M1 or M5
+TRIGGER_LOOKBACK_BARS = int(os.getenv("TRIGGER_LOOKBACK_BARS", "6"))
+
+# Zone & risk sizing (Bari style)
+ZONE_MAX_USD = float(os.getenv("ZONE_MAX_USD", "5"))   # zone width cap (total)
+SL_PAD_USD = float(os.getenv("SL_PAD_USD", "2"))       # SL beyond zone edge
+TP_STEP_USD = float(os.getenv("TP_STEP_USD", "5"))     # TP step
+
+# Zone detection
+SWING_LOOKBACK = int(os.getenv("SWING_LOOKBACK", "3"))  # pivot left/right bars on HTF
+ZONES_KEEP = int(os.getenv("ZONES_KEEP", "2"))          # keep top N supply/demand zones
+REENTRY_MINUTES = int(os.getenv("REENTRY_MINUTES", "45"))  # don't repeat same zone too often
+
+# Backtest
+DATE_FROM = os.getenv("DATE_FROM", "2025-11-01")  # YYYY-MM-DD
+DATE_TO = os.getenv("DATE_TO", "2026-02-01")      # YYYY-MM-DD
+BACKTEST_CSV = os.getenv("BACKTEST_CSV", "")      # optional
+
+
+# =========================
+# Helpers
+# =========================
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def round_int(x: float) -> int:
+    return int(round(float(x)))
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def telegram_send(text: str) -> None:
+    if TELEGRAM_DISABLE:
+        return
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
+        print("[TELEGRAM] Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_IDS")
+        return
+    chat_ids = [c.strip() for c in TELEGRAM_CHAT_IDS.split(",") if c.strip()]
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    for chat_id in chat_ids:
+        try:
+            requests.post(url, json={
+                "chat_id": chat_id,
+                "text": text,
+                "disable_web_page_preview": True
+            }, timeout=10)
+        except Exception as e:
+            print(f"[TELEGRAM] send failed: {e}")
+
+def fmt_side(side: str) -> str:
+    return "🟢BUY" if side.upper() == "BUY" else "🔴SELL"
+
+def mt5_init() -> None:
+    if mt5.initialize():
+        return
+    raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
+
+def mt5_shutdown() -> None:
+    try:
+        mt5.shutdown()
+    except Exception:
+        pass
+
+def tf_to_mt5(tf: str):
+    tf = tf.upper()
+    mapping = {
+        "M1": mt5.TIMEFRAME_M1,
+        "M5": mt5.TIMEFRAME_M5,
+        "M15": mt5.TIMEFRAME_M15,
+        "H1": mt5.TIMEFRAME_H1,
+    }
+    if tf not in mapping:
+        raise ValueError(f"Unsupported TF: {tf}")
+    return mapping[tf]
+
+def mt5_rates(symbol: str, timeframe, n: int) -> pd.DataFrame:
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, n)
+    if rates is None or len(rates) == 0:
+        raise RuntimeError(f"No rates for {symbol} {timeframe}")
+    df = pd.DataFrame(rates)
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    df = df.set_index("time")
+    return df
+
+def mt5_rates_range(symbol: str, timeframe, dt_from: datetime, dt_to: datetime) -> pd.DataFrame:
+    rates = mt5.copy_rates_range(symbol, timeframe, dt_from, dt_to)
+    if rates is None or len(rates) == 0:
+        raise RuntimeError(f"No rates for {symbol} {timeframe} in range")
+    df = pd.DataFrame(rates)
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    df = df.set_index("time")
+    return df
+
+
+# =========================
+# Models
+# =========================
+@dataclass
+class Signal:
+    time: datetime
+    symbol: str
+    side: str                 # BUY / SELL
+    zone_low: int
+    zone_high: int
+    sl: int
+    tps: List[Optional[int]]  # [tp1,tp2,tp3,tp4..] None => HOLD
+    regime: str               # "ZONES"
+    be_after_tp1: bool = True
+    zone_id: str = ""         # internal ID
+
+def format_signal_message(sig: Signal) -> str:
+    # ✅ Keep your clean style
+    lines = []
+    lines.append(f"{DISPLAY_SYMBOL}")
+    lines.append("")
+    lines.append(f"{fmt_side(sig.side)} {sig.zone_low} - {sig.zone_high}")
+    lines.append("")
+    lines.append(f"SL {sig.sl}")
+    lines.append("")
+    for i, tp in enumerate(sig.tps, start=1):
+        if tp is None:
+            lines.append(f"TP{i} HOLD")
+        else:
+            lines.append(f"TP{i} {tp}")
+    if sig.be_after_tp1:
+        lines.append("")
+        lines.append("TP1 után: BE")
+    return "\n".join(lines)
+
+
+# =========================
+# Bari-style Zone Engine
+# =========================
+class Engine:
+    def __init__(self):
+        self.last_signal_time: Optional[datetime] = None
+        self.last_bar_index: int = -999
+        self.zone_last_fired: Dict[str, datetime] = {}  # zone_id -> last fired time
+        self.last_seen_trigger_bar_time: Optional[pd.Timestamp] = None
+
+    # ---------- ZONE DETECTION (HTF) ----------
+    def _pivot_highs_lows(self, df: pd.DataFrame, k: int) -> Tuple[List[Tuple[pd.Timestamp, float]], List[Tuple[pd.Timestamp, float]]]:
+        """
+        Very simple swing pivot detector:
+        pivot high at i if high[i] is the max within [i-k..i+k]
+        pivot low at i if low[i] is the min within [i-k..i+k]
+        """
+        highs = df["high"].values
+        lows = df["low"].values
+        idx = df.index
+
+        piv_hi = []
+        piv_lo = []
+
+        for i in range(k, len(df) - k):
+            h = highs[i]
+            l = lows[i]
+            if h == np.max(highs[i-k:i+k+1]):
+                piv_hi.append((idx[i], float(h)))
+            if l == np.min(lows[i-k:i+k+1]):
+                piv_lo.append((idx[i], float(l)))
+
+        return piv_hi, piv_lo
+
+    def _build_zone(self, level: float, kind: str) -> Tuple[int, int]:
+        """
+        Create tight zone around pivot:
+        total width capped by ZONE_MAX_USD (default 5).
+        """
+        width = int(max(2, round_int(ZONE_MAX_USD)))
+        half = max(1, width // 2)
+        center = round_int(level)
+        low = center - half
+        high = low + width
+        return int(low), int(high)
+
+    def compute_zones(self, df_htf: pd.DataFrame) -> List[Dict[str, Any]]:
+        """
+        Returns list of zones:
+        [
+          {"id": "...", "kind":"SUPPLY"/"DEMAND", "low":..., "high":..., "level":..., "time":...},
+          ...
+        ]
+        """
+        k = int(clamp(SWING_LOOKBACK, 2, 10))
+        piv_hi, piv_lo = self._pivot_highs_lows(df_htf, k)
+
+        # keep newest pivots first
+        piv_hi = list(reversed(piv_hi))[: max(3, ZONES_KEEP * 3)]
+        piv_lo = list(reversed(piv_lo))[: max(3, ZONES_KEEP * 3)]
+
+        zones = []
+        # SUPPLY from highs
+        for t, lvl in piv_hi[:ZONES_KEEP]:
+            low, high = self._build_zone(lvl, "SUPPLY")
+            zid = f"S_{int(t.timestamp())}_{round_int(lvl)}"
+            zones.append({"id": zid, "kind": "SUPPLY", "low": low, "high": high, "level": round_int(lvl), "time": t})
+
+        # DEMAND from lows
+        for t, lvl in piv_lo[:ZONES_KEEP]:
+            low, high = self._build_zone(lvl, "DEMAND")
+            zid = f"D_{int(t.timestamp())}_{round_int(lvl)}"
+            zones.append({"id": zid, "kind": "DEMAND", "low": low, "high": high, "level": round_int(lvl), "time": t})
+
+        # Optional: sort by proximity to current price could be added; keep as newest-first
+        return zones
+
+    # ---------- TRIGGER LOGIC (LTF) ----------
+    def _rejection_trigger(self, zone: Dict[str, Any], bar: pd.Series) -> Optional[str]:
+        """
+        Trigger when price enters zone and rejects:
+        - SUPPLY: wick into zone and close back below zone_low (or bearish body)
+        - DEMAND: wick into zone and close back above zone_high (or bullish body)
+        """
+        zlow, zhigh = zone["low"], zone["high"]
+        o = float(bar["open"])
+        h = float(bar["high"])
+        l = float(bar["low"])
+        c = float(bar["close"])
+
+        # inside/overlap check
+        touched = (h >= zlow) and (l <= zhigh)
+        if not touched:
+            return None
+
+        # SUPPLY -> SELL
+        if zone["kind"] == "SUPPLY":
+            # rejection: went into/above zone and closed below zone_low OR bearish candle in zone
+            if c < zlow or (c < o and h >= zlow):
+                return "SELL"
+
+        # DEMAND -> BUY
+        if zone["kind"] == "DEMAND":
+            # rejection: went into/below zone and closed above zone_high OR bullish candle in zone
+            if c > zhigh or (c > o and l <= zhigh):
+                return "BUY"
+
+        return None
+
+    def _cooldown_ok(self, t: datetime, bar_index: int) -> bool:
+        if self.last_signal_time is None:
+            return True
+        mins = (t - self.last_signal_time).total_seconds() / 60.0
+        if mins < COOLDOWN_MINUTES:
+            return False
+        if (bar_index - self.last_bar_index) < MIN_BARS_BETWEEN_SIGNALS:
+            return False
+        return True
+
+    def _zone_reentry_ok(self, zone_id: str, t: datetime) -> bool:
+        """
+        Avoid firing the same zone too often (common Bari behavior: don't spam same zone).
+        """
+        last = self.zone_last_fired.get(zone_id)
+        if last is None:
+            return True
+        mins = (t - last).total_seconds() / 60.0
+        return mins >= REENTRY_MINUTES
+
+    # ---------- RISK / TP ----------
+    def _make_sl(self, side: str, zone_low: int, zone_high: int) -> int:
+        pad = int(max(1, round_int(SL_PAD_USD)))
+        if side == "BUY":
+            return int(zone_low - pad)
+        else:
+            return int(zone_high + pad)
+
+    def _tp_ladder(self, side: str, entry_ref: int) -> List[Optional[int]]:
+        step = int(max(2, round_int(TP_STEP_USD)))  # default 5
+        if side == "BUY":
+            tp1 = entry_ref + 1 * step
+            tp2 = entry_ref + 2 * step
+            tp3 = entry_ref + 3 * step
+            tp4 = entry_ref + 4 * step
+        else:
+            tp1 = entry_ref - 1 * step
+            tp2 = entry_ref - 2 * step
+            tp3 = entry_ref - 3 * step
+            tp4 = entry_ref - 4 * step
+
+        # Bari-like: often TP1 TP2 TP3 and then HOLD
+        return [tp1, tp2, tp3, None]  # TP4 HOLD
+
+    # ---------- MAIN GENERATOR ----------
+    def generate_signal(self, symbol: str) -> Optional[Signal]:
+        # Pull HTF zones
+        df_htf = mt5_rates(symbol, tf_to_mt5(HTF_TF), 600)
+        zones = self.compute_zones(df_htf)
+        if not zones:
+            return None
+
+        # Pull trigger TF bars
+        df_tr = mt5_rates(symbol, tf_to_mt5(TRIGGER_TF), 600)
+        if df_tr is None or len(df_tr) < 50:
+            return None
+
+        # Scan last N bars for trigger (prevents “missed” signal)
+        lookback = int(clamp(TRIGGER_LOOKBACK_BARS, 1, 30))
+        recent = df_tr.iloc[-lookback:]
+
+        # If data not moving (market closed / no ticks), do nothing
+        last_bar_time = df_tr.index[-1]
+        if self.last_seen_trigger_bar_time is not None and last_bar_time == self.last_seen_trigger_bar_time:
+            # no new bar since last loop
+            return None
+        self.last_seen_trigger_bar_time = last_bar_time
+
+        # For each recent bar, check each zone; pick the first valid (newest bar priority)
+        for i_bar in range(len(recent) - 1, -1, -1):
+            bar_time = recent.index[i_bar].to_pydatetime()
+            bar = recent.iloc[i_bar]
+            bar_index = len(df_tr) - (lookback - i_bar)
+
+            # Global cooldown
+            if not self._cooldown_ok(bar_time, bar_index):
+                continue
+
+            # Prefer closest zones: sort by distance to bar close
+            close = float(bar["close"])
+            zones_sorted = sorted(zones, key=lambda z: abs(((z["low"] + z["high"]) / 2) - close))
+
+            for z in zones_sorted:
+                side = self._rejection_trigger(z, bar)
+                if side is None:
+                    continue
+
+                # Zone re-entry cooldown
+                if not self._zone_reentry_ok(z["id"], bar_time):
+                    continue
+
+                zone_low, zone_high = int(z["low"]), int(z["high"])
+                # entry ref: middle of zone (Bari style)
+                entry_ref = round_int((zone_low + zone_high) / 2)
+
+                sl = self._make_sl(side, zone_low, zone_high)
+                tps = self._tp_ladder(side, entry_ref)
+
+                sig = Signal(
+                    time=bar_time,
+                    symbol=symbol,
+                    side=side,
+                    zone_low=zone_low,
+                    zone_high=zone_high,
+                    sl=sl,
+                    tps=tps,
+                    regime="ZONES",
+                    be_after_tp1=True,
+                    zone_id=z["id"]
+                )
+
+                # update memory
+                self.last_signal_time = bar_time
+                self.last_bar_index = bar_index
+                self.zone_last_fired[z["id"]] = bar_time
+                return sig
+
+        return None
+
+
+# =========================
+# Backtest
+# =========================
+def simulate_trade_path(
+    side: str,
+    entry_ref: int,
+    sl: int,
+    tps: List[Optional[int]],
+    df_forward: pd.DataFrame,
+    be_after_tp1: bool = True
+) -> Tuple[str, float, Optional[datetime], Optional[int]]:
+    """
+    Outcome: SL / BE / TP2 / TP3 / EOD
+    R calc: +1 at TP1 (not returned), +2 TP2, +3 TP3; SL=-1, BE=0.
+    (We score on TP2+ just like your previous sim.)
+    """
+    risk = abs(entry_ref - sl)
+    if risk <= 0:
+        return "EOD", 0.0, None, None
+
+    numeric_tps: List[int] = []
+    for tp in tps:
+        if tp is None:
+            break
+        numeric_tps.append(tp)
+
+    hit_tp1 = False
+    sl_current = sl
+
+    for idx, row in df_forward.iterrows():
+        hi = float(row["high"])
+        lo = float(row["low"])
+
+        if side == "BUY":
+            for i, tp in enumerate(numeric_tps, start=1):
+                if hi >= tp:
+                    if i == 1 and be_after_tp1:
+                        hit_tp1 = True
+                        sl_current = entry_ref
+                    if i >= 2:
+                        return (f"TP{i}", float(i), idx.to_pydatetime(), tp)
+
+            if lo <= sl_current:
+                if hit_tp1 and sl_current == entry_ref:
+                    return ("BE", 0.0, idx.to_pydatetime(), entry_ref)
+                return ("SL", -1.0, idx.to_pydatetime(), sl_current)
+
+        else:
+            for i, tp in enumerate(numeric_tps, start=1):
+                if lo <= tp:
+                    if i == 1 and be_after_tp1:
+                        hit_tp1 = True
+                        sl_current = entry_ref
+                    if i >= 2:
+                        return (f"TP{i}", float(i), idx.to_pydatetime(), tp)
+
+            if hi >= sl_current:
+                if hit_tp1 and sl_current == entry_ref:
+                    return ("BE", 0.0, idx.to_pydatetime(), entry_ref)
+                return ("SL", -1.0, idx.to_pydatetime(), sl_current)
+
+    return ("EOD", 0.0, None, None)
+
+
+def run_backtest():
+    print("===== BACKTEST RESULTS (ZONES ENGINE) =====")
+    print(f"Symbol: {SYMBOL}")
+    print(f"From:   {DATE_FROM}")
+    print(f"To:     {DATE_TO}")
+    print(f"HTF:    {HTF_TF} | Trigger: {TRIGGER_TF}")
+    print()
+
+    mt5_init()
+    try:
+        dt_from = datetime.fromisoformat(DATE_FROM).replace(tzinfo=timezone.utc)
+        dt_to = datetime.fromisoformat(DATE_TO).replace(tzinfo=timezone.utc)
+
+        df_tr = mt5_rates_range(SYMBOL, tf_to_mt5(TRIGGER_TF), dt_from, dt_to)
+        df_htf = mt5_rates_range(SYMBOL, tf_to_mt5(HTF_TF), dt_from, dt_to)
+
+        eng = Engine()
+
+        trades: List[Dict[str, Any]] = []
+        last_sig_time: Optional[datetime] = None
+        cooldown = timedelta(minutes=COOLDOWN_MINUTES)
+
+        # We'll step through trigger bars and rebuild zones based on HTF history up to that time
+        for i in range(200, len(df_tr) - 60):
+            t = df_tr.index[i].to_pydatetime()
+
+            if last_sig_time is not None and (t - last_sig_time) < cooldown:
+                continue
+
+            # build HTF slice up to time t
+            htf_slice = df_htf.loc[:df_tr.index[i]]
+            if len(htf_slice) < 100:
+                continue
+            zones = eng.compute_zones(htf_slice)
+            if not zones:
+                continue
+
+            # build trigger window ending at i
+            recent_window = df_tr.iloc[max(0, i - TRIGGER_LOOKBACK_BARS + 1):i + 1]
+
+            # emulate scan like live: newest bar first
+            sig = None
+            for j in range(len(recent_window) - 1, -1, -1):
+                bar = recent_window.iloc[j]
+                zones_sorted = sorted(zones, key=lambda z: abs(((z["low"] + z["high"]) / 2) - float(bar["close"])))
+                for z in zones_sorted:
+                    side = eng._rejection_trigger(z, bar)
+                    if side is None:
+                        continue
+                    zid = z["id"]
+                    # reentry rule
+                    lastz = eng.zone_last_fired.get(zid)
+                    if lastz is not None and (t - lastz).total_seconds() / 60.0 < REENTRY_MINUTES:
+                        continue
+
+                    zone_low, zone_high = int(z["low"]), int(z["high"])
+                    entry_ref = round_int((zone_low + zone_high) / 2)
+                    sl = eng._make_sl(side, zone_low, zone_high)
+                    tps = eng._tp_ladder(side, entry_ref)
+                    sig = Signal(time=t, symbol=SYMBOL, side=side, zone_low=zone_low, zone_high=zone_high,
+                                sl=sl, tps=tps, regime="ZONES", be_after_tp1=True, zone_id=zid)
+                    eng.zone_last_fired[zid] = t
+                    break
+                if sig is not None:
+                    break
+
+            if sig is None:
+                continue
+
+            # forward simulate
+            forward = df_tr.iloc[i+1:i+1+60]
+            outcome, r_mult, exit_time, exit_price = simulate_trade_path(
+                side=sig.side,
+                entry_ref=round_int((sig.zone_low + sig.zone_high) / 2),
+                sl=sig.sl,
+                tps=sig.tps,
+                df_forward=forward,
+                be_after_tp1=True
+            )
+
+            trades.append({
+                "entry_time": t,
+                "side": sig.side,
+                "entry": round_int((sig.zone_low + sig.zone_high) / 2),
+                "zone_low": sig.zone_low,
+                "zone_high": sig.zone_high,
+                "sl": sig.sl,
+                "tp1": sig.tps[0] if len(sig.tps) > 0 else None,
+                "tp2": sig.tps[1] if len(sig.tps) > 1 else None,
+                "tp3": sig.tps[2] if len(sig.tps) > 2 else None,
+                "tp4": sig.tps[3] if len(sig.tps) > 3 else None,
+                "outcome": outcome,
+                "result_r": r_mult,
+                "exit_time": exit_time,
+                "exit_price": exit_price,
+                "zone_id": sig.zone_id
+            })
+
+            last_sig_time = t
+
+        if not trades:
+            print("No trades.")
+            return
+
+        dftrades = pd.DataFrame(trades)
+
+        def summarize(dfsub: pd.DataFrame, title: str):
+            n = len(dfsub)
+            win = float((dfsub["result_r"] > 0).mean() * 100.0)
+            avg = float(dfsub["result_r"].mean())
+            pos = dfsub.loc[dfsub["result_r"] > 0, "result_r"].sum()
+            neg = -dfsub.loc[dfsub["result_r"] < 0, "result_r"].sum()
+            pfr = float(pos / neg) if neg > 0 else float("inf")
+            eq = dfsub["result_r"].cumsum()
+            dd = (eq - eq.cummax()).min()
+            print(f"--- {title} ---")
+            print(f"Trades: {n} | Winrate: {win:.2f}% | PF(R): {pfr:.2f} | AvgR: {avg:.2f} | MaxDD(R): {dd:.2f}")
+            print(dfsub["outcome"].value_counts().to_string())
+            print()
+
+        summarize(dftrades, "ALL (ZONES)")
+
+        print("Last 10 trades:")
+        cols = ["entry_time","side","entry","sl","tp1","tp2","tp3","tp4","outcome","exit_time","exit_price","result_r","zone_id"]
+        print(dftrades[cols].tail(10).to_string(index=False))
+        print()
+
+        if BACKTEST_CSV:
+            dftrades.to_csv(BACKTEST_CSV, index=False)
+            print(f"Saved CSV: {BACKTEST_CSV}")
+
+    finally:
+        mt5_shutdown()
+
+
+# =========================
+# FastAPI server
+# =========================
+app = FastAPI()
+engine = Engine()
+
+@app.get("/health")
+def health():
+    return {"ok": True, "mode": MODE, "symbol": SYMBOL, "htf": HTF_TF, "trigger": TRIGGER_TF}
+
+@app.post("/signal")
+async def signal_now():
+    mt5_init()
+    try:
+        sig = engine.generate_signal(SYMBOL)
+        if sig is None:
+            return {"ok": True, "signal": None}
+        msg = format_signal_message(sig)
+        telegram_send(msg)
+        return {"ok": True, "signal": {
+            "side": sig.side,
+            "zone_low": sig.zone_low,
+            "zone_high": sig.zone_high,
+            "sl": sig.sl,
+            "tps": sig.tps,
+            "regime": sig.regime,
+            "zone_id": sig.zone_id
+        }}
+    finally:
+        mt5_shutdown()
+
+@app.post("/tv")
+async def tv_webhook(req: Request):
+    try:
+        data = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Bad secret")
+
+    side = str(data.get("side","")).upper()
+    if side not in ("BUY","SELL"):
+        raise HTTPException(status_code=400, detail="Missing side")
+
+    def to_int(v):
+        if v is None:
+            return None
+        return round_int(float(v))
+
+    zone_low = to_int(data.get("zone_low")) or 0
+    zone_high = to_int(data.get("zone_high")) or 0
+    sl = to_int(data.get("sl")) or 0
+
+    tps: List[Optional[int]] = []
+    for k in ["tp1","tp2","tp3","tp4"]:
+        if k in data:
+            v = data.get(k)
+            if v is None:
+                tps.append(None)
+            else:
+                if isinstance(v, str) and "HOLD" in v.upper():
+                    tps.append(None)
+                else:
+                    tps.append(to_int(v))
+
+    sig = Signal(
+        time=now_utc(),
+        symbol=SYMBOL,
+        side=side,
+        zone_low=zone_low,
+        zone_high=zone_high,
+        sl=sl,
+        tps=tps if tps else [None],
+        regime="ZONES",
+        be_after_tp1=True,
+        zone_id="TV"
+    )
+    msg = format_signal_message(sig)
+    telegram_send(msg)
+    return {"ok": True}
+
+def live_loop():
+    print(f"[LIVE] Bari ZONES engine starting for {SYMBOL} (display {DISPLAY_SYMBOL})")
+    print(f"      HTF={HTF_TF}  Trigger={TRIGGER_TF}  LookbackBars={TRIGGER_LOOKBACK_BARS}")
+    print(f"      ZoneMax={ZONE_MAX_USD}$  SLpad={SL_PAD_USD}$  TPstep={TP_STEP_USD}$  Cooldown={COOLDOWN_MINUTES}m")
+    while True:
+        try:
+            mt5_init()
+            try:
+                sig = engine.generate_signal(SYMBOL)
+                if sig is not None:
+                    msg = format_signal_message(sig)
+                    print("\n" + msg + "\n")
+                    telegram_send(msg)
+            finally:
+                mt5_shutdown()
+        except Exception as e:
+            print(f"[LIVE] error: {e}")
+        time.sleep(15)  # check frequently; trigger bar time prevents duplicates
+
+if __name__ == "__main__":
+    if MODE == "BACKTEST":
+        run_backtest()
+    else:
+        if os.getenv("LIVE_LOOP", "1") == "1":
+            live_loop()
+        else:
+            import uvicorn
+            uvicorn.run("server:app", host="127.0.0.1", port=int(os.getenv("PORT","8001")))
