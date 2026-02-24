@@ -1,0 +1,1390 @@
+import os
+import time
+import math
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Dict, Any, List, Tuple
+
+import numpy as np
+import pandas as pd
+
+import MetaTrader5 as mt5
+import requests
+
+PRE_MODE = os.getenv("MODE", "LIVE").upper()
+
+if PRE_MODE != "BACKTEST":
+    from fastapi import FastAPI, Request, HTTPException
+    from fastapi.responses import HTMLResponse
+    FASTAPI_AVAILABLE = True
+else:
+    FASTAPI_AVAILABLE = False
+
+    class HTTPException(Exception):
+        def __init__(self, status_code: int = 500, detail: str = ""):
+            super().__init__(f"HTTP {status_code}: {detail}")
+            self.status_code = status_code
+            self.detail = detail
+
+    class HTMLResponse(str):
+        pass
+
+    class _DummyApp:
+        def get(self, *args, **kwargs):
+            def dec(fn):
+                return fn
+            return dec
+
+        def post(self, *args, **kwargs):
+            def dec(fn):
+                return fn
+            return dec
+
+    def FastAPI(*args, **kwargs):
+        return _DummyApp()
+
+    class Request:
+        pass
+
+
+# =========================
+# Minimal .env loader (no extra dependency)
+# =========================
+def _load_dotenv(path: str = ".env") -> None:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                os.environ.setdefault(k, v)
+    except FileNotFoundError:
+        return
+
+
+_load_dotenv()
+
+
+# =========================
+# CONFIG / ENV
+# =========================
+MODE = os.getenv("MODE", "LIVE").upper()  # LIVE | BACKTEST
+
+SYMBOL = os.getenv("SYMBOL", "XAUUSD.s")  # broker symbol
+DISPLAY_SYMBOL = os.getenv("DISPLAY_SYMBOL", "XAUUSD")  # telegram display only
+
+# Telegram
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_IDS = os.getenv("TELEGRAM_CHAT_IDS", "")
+TELEGRAM_DISABLE = os.getenv("TELEGRAM_DISABLE", "0") == "1"
+
+# Optional webhook secret
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+
+# Cooldown / density
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "5"))
+MIN_BARS_BETWEEN_SIGNALS = int(os.getenv("MIN_BARS_BETWEEN_SIGNALS", "1"))
+IGNORE_COOLDOWN_ON_SIDE_FLIP = os.getenv("IGNORE_COOLDOWN_ON_SIDE_FLIP", "1") == "1"
+OPPOSITE_SIGNAL_COOLDOWN_MINUTES = int(os.getenv("OPPOSITE_SIGNAL_COOLDOWN_MINUTES", "15"))
+
+# HTF + Trigger TF
+HTF_TF = os.getenv("HTF_TF", "H1").upper()  # H1 or M15
+TRIGGER_TF = os.getenv("TRIGGER_TF", "M5").upper()  # M1 or M5
+TRIGGER_LOOKBACK_BARS = int(os.getenv("TRIGGER_LOOKBACK_BARS", "6"))
+RECHECK_SAME_BAR = os.getenv("RECHECK_SAME_BAR", "1") == "1"
+ENABLE_PROXIMITY_TRIGGER = os.getenv("ENABLE_PROXIMITY_TRIGGER", "1") == "1"
+TRIGGER_PROXIMITY_USD = float(os.getenv("TRIGGER_PROXIMITY_USD", "3"))
+CONTINUATION_MIN_BODY_RATIO = float(os.getenv("CONTINUATION_MIN_BODY_RATIO", "0.45"))
+
+# Zone & risk sizing (Bari style)
+ZONE_MAX_USD = float(os.getenv("ZONE_MAX_USD", "5"))
+SL_BASE_USD = float(os.getenv("SL_BASE_USD", "5"))
+SL_MAX_USD = float(os.getenv("SL_MAX_USD", "7"))
+TP_STEP_USD = float(os.getenv("TP_STEP_USD", "5"))
+
+# Zone detection
+SWING_LOOKBACK = int(os.getenv("SWING_LOOKBACK", "3"))
+ZONES_KEEP = int(os.getenv("ZONES_KEEP", "2"))
+USE_DEVELOPING_ZONES = os.getenv("USE_DEVELOPING_ZONES", "1") == "1"
+DEVELOPING_LOOKBACK_HTF = int(os.getenv("DEVELOPING_LOOKBACK_HTF", "12"))
+ZONE_MERGE_TOL_USD = float(os.getenv("ZONE_MERGE_TOL_USD", "1"))
+REENTRY_MINUTES = int(os.getenv("REENTRY_MINUTES", "30"))
+ZONE_REENTRY_BUCKET_USD = float(os.getenv("ZONE_REENTRY_BUCKET_USD", "2"))
+STATUS_LOG_MINUTES = int(os.getenv("STATUS_LOG_MINUTES", "5"))
+DUPLICATE_SIGNAL_BLOCK_MINUTES = int(os.getenv("DUPLICATE_SIGNAL_BLOCK_MINUTES", "180"))
+
+# Regime (trend/range/volatile) + AI-assist
+REGIME_MODE = os.getenv("REGIME_MODE", "HYBRID").upper()  # OFF | RULES | AI | HYBRID
+REGIME_TF = os.getenv("REGIME_TF", HTF_TF).upper()
+REGIME_ADX_PERIOD = int(os.getenv("REGIME_ADX_PERIOD", "14"))
+REGIME_ATR_PERIOD = int(os.getenv("REGIME_ATR_PERIOD", "14"))
+REGIME_EMA_FAST = int(os.getenv("REGIME_EMA_FAST", "50"))
+REGIME_EMA_SLOW = int(os.getenv("REGIME_EMA_SLOW", "200"))
+REGIME_TREND_ADX_MIN = float(os.getenv("REGIME_TREND_ADX_MIN", "20"))
+REGIME_RANGE_ADX_MAX = float(os.getenv("REGIME_RANGE_ADX_MAX", "16"))
+REGIME_VOL_ATR_MULT = float(os.getenv("REGIME_VOL_ATR_MULT", "1.6"))
+
+# AI self-calibration
+AI_REGIME_LOOKBACK = int(os.getenv("AI_REGIME_LOOKBACK", "800"))
+AI_REGIME_TRAIN_EPOCHS = int(os.getenv("AI_REGIME_TRAIN_EPOCHS", "80"))
+AI_REGIME_LR = float(os.getenv("AI_REGIME_LR", "0.08"))
+AI_REGIME_SMOOTH = float(os.getenv("AI_REGIME_SMOOTH", "0.20"))
+
+# Trend-mode restrictions
+TREND_ONLY_WITH_EMA = os.getenv("TREND_ONLY_WITH_EMA", "1") == "1"
+TREND_MIN_PULLBACK_USD = float(os.getenv("TREND_MIN_PULLBACK_USD", "2"))
+
+# Extra anti-flip protection
+MIN_OPPOSITE_GAP_MINUTES = int(os.getenv("MIN_OPPOSITE_GAP_MINUTES", str(OPPOSITE_SIGNAL_COOLDOWN_MINUTES)))
+SHOW_REGIME_INFO = os.getenv("SHOW_REGIME_INFO", "0") == "1"
+
+# Backtest
+DATE_FROM = os.getenv("DATE_FROM", "2025-11-01")
+DATE_TO = os.getenv("DATE_TO", "2026-02-01")
+BACKTEST_CSV = os.getenv("BACKTEST_CSV", "")
+
+
+# =========================
+# Helpers
+# =========================
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def round_int(x: float) -> int:
+    return int(round(float(x)))
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def telegram_send(text: str) -> None:
+    if TELEGRAM_DISABLE:
+        return
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
+        print("[TELEGRAM] Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_IDS")
+        return
+    chat_ids = [c.strip() for c in TELEGRAM_CHAT_IDS.split(",") if c.strip()]
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    for chat_id in chat_ids:
+        try:
+            requests.post(
+                url,
+                json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+                timeout=10,
+            )
+        except Exception as e:
+            print(f"[TELEGRAM] send failed: {e}")
+
+
+def fmt_side(side: str) -> str:
+    return "🟢BUY" if side.upper() == "BUY" else "🔴SELL"
+
+
+def mt5_init() -> None:
+    if mt5.initialize():
+        return
+    raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
+
+
+def mt5_shutdown() -> None:
+    try:
+        mt5.shutdown()
+    except Exception:
+        pass
+
+
+def tf_to_mt5(tf: str):
+    tf = tf.upper()
+    mapping = {
+        "M1": mt5.TIMEFRAME_M1,
+        "M5": mt5.TIMEFRAME_M5,
+        "M15": mt5.TIMEFRAME_M15,
+        "H1": mt5.TIMEFRAME_H1,
+    }
+    if tf not in mapping:
+        raise ValueError(f"Unsupported TF: {tf}")
+    return mapping[tf]
+
+
+def mt5_rates(symbol: str, timeframe, n: int) -> pd.DataFrame:
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, n)
+    if rates is None or len(rates) == 0:
+        raise RuntimeError(f"No rates for {symbol} {timeframe}")
+    df = pd.DataFrame(rates)
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    df = df.set_index("time")
+    return df
+
+
+def mt5_rates_range(symbol: str, timeframe, dt_from: datetime, dt_to: datetime) -> pd.DataFrame:
+    rates = mt5.copy_rates_range(symbol, timeframe, dt_from, dt_to)
+    if rates is None or len(rates) == 0:
+        raise RuntimeError(f"No rates for {symbol} {timeframe} in range")
+    df = pd.DataFrame(rates)
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    df = df.set_index("time")
+    return df
+
+
+# =========================
+# Indicators
+# =========================
+def ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=max(2, int(period)), adjust=False).mean()
+
+
+def true_range(df: pd.DataFrame) -> pd.Series:
+    prev_close = df["close"].shift(1)
+    tr = pd.concat(
+        [
+            (df["high"] - df["low"]).abs(),
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr
+
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    tr = true_range(df)
+    return tr.ewm(alpha=1.0 / max(2, int(period)), adjust=False).mean()
+
+
+def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    period = max(2, int(period))
+    high = df["high"]
+    low = df["low"]
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    tr = true_range(df)
+    atr_w = tr.ewm(alpha=1.0 / period, adjust=False).mean()
+    plus_di = 100.0 * (plus_dm.ewm(alpha=1.0 / period, adjust=False).mean() / atr_w).replace(
+        [np.inf, -np.inf], np.nan
+    )
+    minus_di = 100.0 * (minus_dm.ewm(alpha=1.0 / period, adjust=False).mean() / atr_w).replace(
+        [np.inf, -np.inf], np.nan
+    )
+
+    dx = (100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di)).replace([np.inf, -np.inf], np.nan)
+    return dx.ewm(alpha=1.0 / period, adjust=False).mean()
+
+
+def zscore(series: pd.Series, window: int) -> pd.Series:
+    window = max(10, int(window))
+    mu = series.rolling(window).mean()
+    sd = series.rolling(window).std(ddof=0)
+    return (series - mu) / sd.replace(0, np.nan)
+
+
+class TinyLogReg:
+    def __init__(self, n_features: int):
+        self.w = np.zeros(n_features, dtype=float)
+        self.b = 0.0
+
+    @staticmethod
+    def _sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        z = X @ self.w + self.b
+        return self._sigmoid(z)
+
+    def fit(self, X: np.ndarray, y: np.ndarray, lr: float = 0.05, epochs: int = 50):
+        n = max(1, X.shape[0])
+        for _ in range(max(1, int(epochs))):
+            p = self.predict_proba(X)
+            grad_w = (X.T @ (p - y)) / n
+            grad_b = float(np.mean(p - y))
+            self.w -= lr * grad_w
+            self.b -= lr * grad_b
+        return self
+
+
+# =========================
+# Models
+# =========================
+@dataclass
+class Signal:
+    time: datetime
+    symbol: str
+    side: str
+    zone_low: int
+    zone_high: int
+    sl: int
+    tps: List[Optional[int]]
+    regime: str
+    trend_dir: str = ""
+    regime_conf: float = 0.0
+    be_after_tp1: bool = True
+    zone_id: str = ""
+
+
+def format_signal_message(sig: Signal) -> str:
+    lines = []
+    lines.append(f"{DISPLAY_SYMBOL}")
+    lines.append("")
+    lines.append(f"{fmt_side(sig.side)} {sig.zone_low} - {sig.zone_high}")
+    lines.append("")
+    lines.append(f"SL {sig.sl}")
+    lines.append("")
+    for i, tp in enumerate(sig.tps, start=1):
+        lines.append(f"TP{i} HOLD" if tp is None else f"TP{i} {tp}")
+    if sig.be_after_tp1:
+        lines.append("")
+        lines.append("TP1 után: BE")
+    if SHOW_REGIME_INFO and sig.regime:
+        lines.append("")
+        if sig.regime_conf > 0:
+            lines.append(f"Regime: {sig.regime} ({sig.trend_dir}) conf={sig.regime_conf:.2f}")
+        else:
+            lines.append(f"Regime: {sig.regime} ({sig.trend_dir})")
+    return "\n".join(lines)
+
+
+# =========================
+# Bari-style Zone Engine
+# =========================
+class Engine:
+    def __init__(self):
+        self.last_signal_time: Optional[datetime] = None
+        self.last_bar_index: int = -999
+        self.zone_last_fired: Dict[str, datetime] = {}
+        self.last_seen_trigger_bar_time: Optional[pd.Timestamp] = None
+        self.last_status_log_time: Optional[datetime] = None
+        self.last_no_signal_reason: str = "startup"
+        self.last_scan_reason: str = "startup"
+        self.last_signal_side: Optional[str] = None
+        self.signal_signature_last_fired: Dict[str, datetime] = {}
+
+        self._regime_prob_trend: float = 0.5
+        self._last_regime: str = "OFF"
+        self._last_trend_dir: str = ""
+        self._last_regime_conf: float = 0.0
+
+    def _trend_direction(self, df: pd.DataFrame) -> str:
+        if df is None or len(df) < max(REGIME_EMA_SLOW, REGIME_EMA_FAST) + 5:
+            return ""
+        c = df["close"]
+        ef = ema(c, REGIME_EMA_FAST)
+        es = ema(c, REGIME_EMA_SLOW)
+        last = df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
+        if float(ef.iloc[-2]) > float(es.iloc[-2]) and float(last["close"]) > float(es.iloc[-2]):
+            return "BULL"
+        if float(ef.iloc[-2]) < float(es.iloc[-2]) and float(last["close"]) < float(es.iloc[-2]):
+            return "BEAR"
+        return ""
+
+    def _rules_regime(self, df: pd.DataFrame) -> Tuple[str, float]:
+        if df is None or len(df) < 60:
+            return ("OFF", 0.0)
+
+        adx_s = adx(df, REGIME_ADX_PERIOD)
+        atr_s = atr(df, REGIME_ATR_PERIOD)
+        adx_last = float(adx_s.iloc[-2])
+        atr_last = float(atr_s.iloc[-2])
+
+        atr_med = float(atr_s.dropna().iloc[-min(200, len(atr_s.dropna())):].median()) if atr_s.notna().any() else atr_last
+        volatile = (atr_med > 0) and (atr_last >= atr_med * float(REGIME_VOL_ATR_MULT))
+
+        if volatile:
+            conf = clamp((atr_last / max(1e-9, atr_med) - float(REGIME_VOL_ATR_MULT)) / 1.5, 0.0, 1.0)
+            return ("VOLATILE", conf)
+
+        if adx_last >= float(REGIME_TREND_ADX_MIN):
+            conf = clamp((adx_last - float(REGIME_TREND_ADX_MIN)) / 15.0, 0.0, 1.0)
+            return ("TREND", conf)
+
+        if adx_last <= float(REGIME_RANGE_ADX_MAX):
+            conf = clamp((float(REGIME_RANGE_ADX_MAX) - adx_last) / 10.0, 0.0, 1.0)
+            return ("RANGE", conf)
+
+        return ("RANGE", 0.2)
+
+    def _ai_regime(self, df: pd.DataFrame) -> Tuple[str, float]:
+        if df is None or len(df) < 120:
+            return ("OFF", 0.0)
+
+        close = df["close"]
+        ret1 = close.pct_change().fillna(0.0)
+        a = atr(df, REGIME_ATR_PERIOD).bfill().fillna(0.0)
+        ad = adx(df, REGIME_ADX_PERIOD).bfill().fillna(0.0)
+        zret = zscore(ret1, 80).fillna(0.0)
+
+        ef = ema(close, REGIME_EMA_FAST).bfill()
+        es = ema(close, REGIME_EMA_SLOW).bfill()
+        emadiff = ((ef - es) / close.replace(0, float("nan"))).fillna(0.0)
+
+        teacher = []
+        for i in range(60, len(df)):
+            sub = df.iloc[: i + 1]
+            reg, _ = self._rules_regime(sub)
+            teacher.append(1.0 if reg == "TREND" else 0.0)
+        teacher = np.array(teacher, dtype=float)
+
+        start = 60
+
+        # safer feature building
+        med = a.iloc[start:].rolling(120).median().bfill()
+        med = med.replace(0, float("nan"))
+        atr_rel = (a.iloc[start:] / med).fillna(1.0).values
+
+        adx_rel = (ad.iloc[start:] / 50.0).clip(0, 2).values
+        ema_feat = emadiff.iloc[start:].clip(-0.01, 0.01).values * 100.0
+
+        X = np.column_stack(
+            [
+                zret.iloc[start:].values,
+                atr_rel,
+                adx_rel,
+                ema_feat,
+            ]
+        )
+
+        lb = int(clamp(AI_REGIME_LOOKBACK, 200, 4000))
+        if len(X) > lb:
+            X = X[-lb:]
+            y = teacher[-lb:]
+        else:
+            y = teacher
+
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+        model = TinyLogReg(X.shape[1]).fit(
+            X, y, lr=float(AI_REGIME_LR), epochs=int(AI_REGIME_TRAIN_EPOCHS)
+        )
+        p_trend = float(model.predict_proba(X[-1:])[0])
+
+        alpha = clamp(float(AI_REGIME_SMOOTH), 0.0, 1.0)
+        self._regime_prob_trend = (1 - alpha) * self._regime_prob_trend + alpha * p_trend
+
+        if self._regime_prob_trend >= 0.60:
+            return ("TREND", self._regime_prob_trend)
+        if self._regime_prob_trend <= 0.40:
+            return ("RANGE", 1.0 - self._regime_prob_trend)
+        return ("RANGE", 0.5)
+
+    def classify_regime(self, df_regime: pd.DataFrame) -> Tuple[str, str, float]:
+        trend_dir = self._trend_direction(df_regime)
+
+        if REGIME_MODE == "OFF":
+            reg, conf = ("OFF", 0.0)
+        elif REGIME_MODE == "RULES":
+            reg, conf = self._rules_regime(df_regime)
+        elif REGIME_MODE == "AI":
+            reg, conf = self._ai_regime(df_regime)
+        else:  # HYBRID
+            reg_r, conf_r = self._rules_regime(df_regime)
+            reg_a, conf_a = self._ai_regime(df_regime)
+            if reg_r == "VOLATILE":
+                reg, conf = reg_r, max(conf_r, 0.6)
+            else:
+                if conf_a >= 0.65:
+                    reg, conf = reg_a, conf_a
+                else:
+                    reg, conf = reg_r, conf_r
+
+        self._last_regime = reg
+        self._last_trend_dir = trend_dir
+        self._last_regime_conf = float(conf)
+        return reg, trend_dir, float(conf)
+
+    # ---------- ZONE DETECTION (HTF) ----------
+    def _pivot_highs_lows(self, df: pd.DataFrame, k: int) -> Tuple[List[Tuple[pd.Timestamp, float]], List[Tuple[pd.Timestamp, float]]]:
+        highs = df["high"].values
+        lows = df["low"].values
+        idx = df.index
+
+        piv_hi = []
+        piv_lo = []
+
+        for i in range(k, len(df) - k):
+            h = highs[i]
+            l = lows[i]
+            if h == np.max(highs[i - k : i + k + 1]):
+                piv_hi.append((idx[i], float(h)))
+            if l == np.min(lows[i - k : i + k + 1]):
+                piv_lo.append((idx[i], float(l)))
+
+        return piv_hi, piv_lo
+
+    def _build_zone(self, level: float, kind: str) -> Tuple[int, int]:
+        width = int(max(2, round_int(ZONE_MAX_USD)))
+        half = max(1, width // 2)
+        center = round_int(level)
+        low = center - half
+        high = low + width
+        return int(low), int(high)
+
+    def compute_zones(self, df_htf: pd.DataFrame) -> List[Dict[str, Any]]:
+        k = int(clamp(SWING_LOOKBACK, 2, 10))
+        piv_hi, piv_lo = self._pivot_highs_lows(df_htf, k)
+
+        piv_hi = list(reversed(piv_hi))[: max(3, ZONES_KEEP * 3)]
+        piv_lo = list(reversed(piv_lo))[: max(3, ZONES_KEEP * 3)]
+
+        zones: List[Dict[str, Any]] = []
+
+        def append_zone(kind: str, t: pd.Timestamp, lvl: float, prefix: str) -> None:
+            lvl_i = round_int(lvl)
+            merge_tol = int(max(1, round_int(ZONE_MERGE_TOL_USD)))
+            for z in zones:
+                if z["kind"] == kind and abs(int(z["level"]) - lvl_i) <= merge_tol:
+                    return
+            low, high = self._build_zone(lvl_i, kind)
+            zid = f"{prefix}_{int(t.timestamp())}_{lvl_i}"
+            zones.append({"id": zid, "kind": kind, "low": low, "high": high, "level": lvl_i, "time": t})
+
+        for t, lvl in piv_hi[:ZONES_KEEP]:
+            append_zone("SUPPLY", t, lvl, "S")
+
+        for t, lvl in piv_lo[:ZONES_KEEP]:
+            append_zone("DEMAND", t, lvl, "D")
+
+        if USE_DEVELOPING_ZONES and len(df_htf) >= 5:
+            look = int(clamp(DEVELOPING_LOOKBACK_HTF, 4, 80))
+            recent = df_htf.iloc[-look:]
+            t_recent = recent.index[-1]
+
+            recent_high = float(recent["high"].max())
+            recent_low = float(recent["low"].min())
+            append_zone("SUPPLY", t_recent, recent_high, "DS")
+            append_zone("DEMAND", t_recent, recent_low, "DD")
+
+            if len(df_htf) >= 2:
+                last_closed = df_htf.iloc[-2]
+                t_last = df_htf.index[-2]
+                append_zone("SUPPLY", t_last, float(last_closed["high"]), "LS")
+                append_zone("DEMAND", t_last, float(last_closed["low"]), "LD")
+
+        return zones
+
+    # ---------- TRIGGER LOGIC (LTF) ----------
+    def _rejection_trigger(self, zone: Dict[str, Any], bar: pd.Series, allow_proximity: bool = True) -> Optional[str]:
+        zlow, zhigh = zone["low"], zone["high"]
+        o = float(bar["open"])
+        h = float(bar["high"])
+        l = float(bar["low"])
+        c = float(bar["close"])
+
+        rng = max(0.5, h - l)
+        body_ratio = abs(c - o) / rng
+        proximity = float(max(0.5, TRIGGER_PROXIMITY_USD))
+
+        touched = (h >= zlow) and (l <= zhigh)
+
+        if zone["kind"] == "SUPPLY":
+            if touched:
+                if c < zlow or (c < o and h >= zlow):
+                    return "SELL"
+
+            if allow_proximity and ENABLE_PROXIMITY_TRIGGER:
+                near_supply = (h >= (zlow - proximity)) and (c <= zlow)
+                if near_supply and c < o and body_ratio >= CONTINUATION_MIN_BODY_RATIO:
+                    return "SELL"
+
+        if zone["kind"] == "DEMAND":
+            if touched:
+                if c > zhigh or (c > o and l <= zhigh):
+                    return "BUY"
+
+            if allow_proximity and ENABLE_PROXIMITY_TRIGGER:
+                near_demand = (l <= (zhigh + proximity)) and (c >= zhigh)
+                if near_demand and c > o and body_ratio >= CONTINUATION_MIN_BODY_RATIO:
+                    return "BUY"
+
+        return None
+
+    def _cooldown_ok(self, t: datetime, bar_index: int, side: Optional[str] = None) -> bool:
+        if self.last_signal_time is None:
+            return True
+        mins = (t - self.last_signal_time).total_seconds() / 60.0
+
+        if side and self.last_signal_side and side != self.last_signal_side:
+            if mins < max(0, MIN_OPPOSITE_GAP_MINUTES):
+                return False
+            if IGNORE_COOLDOWN_ON_SIDE_FLIP:
+                return True
+
+        if mins < COOLDOWN_MINUTES:
+            return False
+        if (bar_index - self.last_bar_index) < MIN_BARS_BETWEEN_SIGNALS:
+            return False
+        return True
+
+    def _zone_reentry_key(self, zone: Dict[str, Any], side: str) -> str:
+        bucket = int(max(1, round_int(ZONE_REENTRY_BUCKET_USD)))
+        mid = round_int((float(zone["low"]) + float(zone["high"])) / 2.0)
+        snapped = int(round(mid / bucket) * bucket)
+        return f"{zone['kind']}:{side}:{snapped}"
+
+    def _signal_signature(self, side: str, zone_low: int, zone_high: int, sl: int, tps: List[Optional[int]]) -> str:
+        tp1 = tps[0] if len(tps) > 0 else None
+        tp2 = tps[1] if len(tps) > 1 else None
+        return f"{side}:{zone_low}:{zone_high}:{sl}:{tp1}:{tp2}"
+
+    def _duplicate_signal_ok(self, sig_key: str, t: datetime) -> bool:
+        last = self.signal_signature_last_fired.get(sig_key)
+        if last is None:
+            return True
+        mins = (t - last).total_seconds() / 60.0
+        return mins >= max(0, DUPLICATE_SIGNAL_BLOCK_MINUTES)
+
+    def _zone_reentry_ok(self, zone_id: str, t: datetime) -> bool:
+        last = self.zone_last_fired.get(zone_id)
+        if last is None:
+            return True
+        mins = (t - last).total_seconds() / 60.0
+        return mins >= REENTRY_MINUTES
+
+    # ---------- RISK / TP ----------
+    def _signal_strength(self, side: str, zone: Dict[str, Any], bar: pd.Series) -> float:
+        o = float(bar["open"])
+        h = float(bar["high"])
+        l = float(bar["low"])
+        c = float(bar["close"])
+        rng = max(0.5, h - l)
+        body = abs(c - o)
+
+        body_ratio = clamp(body / rng, 0.0, 1.0)
+
+        zlow, zhigh = float(zone["low"]), float(zone["high"])
+        zmid = (zlow + zhigh) / 2.0
+
+        if side == "BUY":
+            directional = clamp((c - zmid) / max(1.0, ZONE_MAX_USD), 0.0, 1.0)
+        else:
+            directional = clamp((zmid - c) / max(1.0, ZONE_MAX_USD), 0.0, 1.0)
+
+        upper_wick = max(0.0, h - max(o, c))
+        lower_wick = max(0.0, min(o, c) - l)
+        if side == "BUY":
+            opposite_wick_penalty = clamp(upper_wick / rng, 0.0, 1.0)
+        else:
+            opposite_wick_penalty = clamp(lower_wick / rng, 0.0, 1.0)
+
+        score = (0.45 * body_ratio) + (0.45 * directional) + (0.10 * (1.0 - opposite_wick_penalty))
+        return clamp(score, 0.0, 1.0)
+
+    def _make_sl(self, side: str, zone_low: int, zone_high: int, strength: float) -> int:
+        base = int(max(2, round_int(SL_BASE_USD)))
+        hard_cap = int(max(base, round_int(SL_MAX_USD)))
+
+        dynamic = base + (1 if strength >= 0.65 else 0)
+        distance = int(clamp(dynamic, 2, hard_cap))
+
+        if side == "BUY":
+            return int(zone_low - distance)
+        else:
+            return int(zone_high + distance)
+
+    def _tp_ladder(self, side: str, entry_ref: int, strength: float) -> List[Optional[int]]:
+        step = int(max(2, round_int(TP_STEP_USD)))
+        if side == "BUY":
+            tp1 = entry_ref + 1 * step
+            tp2 = entry_ref + 2 * step
+            tp3 = entry_ref + 3 * step
+        else:
+            tp1 = entry_ref - 1 * step
+            tp2 = entry_ref - 2 * step
+            tp3 = entry_ref - 3 * step
+
+        if strength >= 0.65:
+            return [tp1, tp2, tp3, None]
+        if strength >= 0.45:
+            return [tp1, tp2, None]
+        return [tp1, None]
+
+    # ---------- MAIN GENERATOR ----------
+    def generate_signal(self, symbol: str) -> Optional[Signal]:
+        df_htf = mt5_rates(symbol, tf_to_mt5(HTF_TF), 600)
+
+        df_reg = df_htf
+        if REGIME_TF != HTF_TF:
+            df_reg = mt5_rates(symbol, tf_to_mt5(REGIME_TF), 800)
+        regime, trend_dir, regime_conf = self.classify_regime(df_reg)
+
+        zones = self.compute_zones(df_htf)
+        if not zones:
+            return None
+
+        df_tr = mt5_rates(symbol, tf_to_mt5(TRIGGER_TF), 600)
+        if df_tr is None or len(df_tr) < 50:
+            return None
+
+        lookback = int(clamp(TRIGGER_LOOKBACK_BARS, 1, 30))
+        recent = df_tr.iloc[-lookback:]
+
+        last_bar_time = df_tr.index[-1]
+        if (not RECHECK_SAME_BAR) and self.last_seen_trigger_bar_time is not None and last_bar_time == self.last_seen_trigger_bar_time:
+            self.last_no_signal_reason = "no_new_trigger_bar"
+            return None
+        self.last_seen_trigger_bar_time = last_bar_time
+
+        cooldown_block = 0
+        reject_block = 0
+        reentry_block = 0
+        duplicate_block = 0
+
+        for i_bar in range(len(recent) - 1, -1, -1):
+            bar_time = recent.index[i_bar].to_pydatetime()
+            bar = recent.iloc[i_bar]
+            bar_index = len(df_tr) - (lookback - i_bar)
+
+            close = float(bar["close"])
+            zones_sorted = sorted(zones, key=lambda z: abs(((z["low"] + z["high"]) / 2) - close))
+
+            for z in zones_sorted:
+                allow_prox = (regime != "VOLATILE")
+                side = self._rejection_trigger(z, bar, allow_proximity=allow_prox)
+                if side is None:
+                    reject_block += 1
+                    continue
+
+                if regime == "TREND" and TREND_ONLY_WITH_EMA and trend_dir in ("BULL", "BEAR"):
+                    if trend_dir == "BULL" and side != "BUY":
+                        continue
+                    if trend_dir == "BEAR" and side != "SELL":
+                        continue
+                    if trend_dir == "BULL" and z.get("kind") != "DEMAND":
+                        continue
+                    if trend_dir == "BEAR" and z.get("kind") != "SUPPLY":
+                        continue
+
+                    pull_min = float(max(0.0, TREND_MIN_PULLBACK_USD))
+                    if pull_min > 0:
+                        if side == "BUY":
+                            depth = float(z["high"]) - float(bar["low"])
+                            if depth < pull_min:
+                                continue
+                        else:
+                            depth = float(bar["high"]) - float(z["low"])
+                            if depth < pull_min:
+                                continue
+
+                if regime == "VOLATILE":
+                    strength_tmp = self._signal_strength(side, z, bar)
+                    if strength_tmp < 0.55:
+                        continue
+
+                if not self._cooldown_ok(bar_time, bar_index, side):
+                    cooldown_block += 1
+                    continue
+
+                zkey = self._zone_reentry_key(z, side)
+                if not self._zone_reentry_ok(zkey, bar_time):
+                    reentry_block += 1
+                    continue
+
+                zone_low, zone_high = int(z["low"]), int(z["high"])
+                entry_ref = round_int((zone_low + zone_high) / 2)
+
+                strength = self._signal_strength(side, z, bar)
+                sl = self._make_sl(side, zone_low, zone_high, strength)
+                tps = self._tp_ladder(side, entry_ref, strength)
+
+                sig_key = self._signal_signature(side, zone_low, zone_high, sl, tps)
+                if not self._duplicate_signal_ok(sig_key, bar_time):
+                    duplicate_block += 1
+                    continue
+
+                sig = Signal(
+                    time=bar_time,
+                    symbol=symbol,
+                    side=side,
+                    zone_low=zone_low,
+                    zone_high=zone_high,
+                    sl=sl,
+                    tps=tps,
+                    regime=regime,
+                    trend_dir=trend_dir,
+                    regime_conf=float(regime_conf),
+                    be_after_tp1=True,
+                    zone_id=z["id"],
+                )
+
+                self.last_signal_time = bar_time
+                self.last_bar_index = bar_index
+                self.zone_last_fired[zkey] = bar_time
+                self.last_no_signal_reason = "signal_found"
+                self.signal_signature_last_fired[sig_key] = bar_time
+                self.last_scan_reason = "signal_found"
+                self.last_signal_side = side
+                return sig
+
+        self.last_no_signal_reason = (
+            f"no_setup(cooldown={cooldown_block},rejection={reject_block},reentry={reentry_block},duplicate={duplicate_block},"
+            f"zones={len(zones)},lookback={lookback},recheck_same_bar={int(RECHECK_SAME_BAR)},min_opp_gap={MIN_OPPOSITE_GAP_MINUTES},regime={regime})"
+        )
+        self.last_scan_reason = self.last_no_signal_reason
+        return None
+
+
+# =========================
+# Backtest
+# =========================
+def simulate_trade_path(
+    side: str,
+    entry_ref: int,
+    sl: int,
+    tps: List[Optional[int]],
+    df_forward: pd.DataFrame,
+    be_after_tp1: bool = True,
+) -> Tuple[str, float, Optional[datetime], Optional[int]]:
+    risk = abs(entry_ref - sl)
+    if risk <= 0:
+        return "EOD", 0.0, None, None
+
+    numeric_tps: List[int] = []
+    for tp in tps:
+        if tp is None:
+            break
+        numeric_tps.append(tp)
+
+    hit_tp1 = False
+    sl_current = sl
+
+    for idx, row in df_forward.iterrows():
+        hi = float(row["high"])
+        lo = float(row["low"])
+
+        if side == "BUY":
+            for i, tp in enumerate(numeric_tps, start=1):
+                if hi >= tp:
+                    if i == 1 and be_after_tp1:
+                        hit_tp1 = True
+                        sl_current = entry_ref
+                    if i >= 2:
+                        return (f"TP{i}", float(i), idx.to_pydatetime(), tp)
+
+            if lo <= sl_current:
+                if hit_tp1 and sl_current == entry_ref:
+                    return ("BE", 0.0, idx.to_pydatetime(), entry_ref)
+                return ("SL", -1.0, idx.to_pydatetime(), sl_current)
+
+        else:
+            for i, tp in enumerate(numeric_tps, start=1):
+                if lo <= tp:
+                    if i == 1 and be_after_tp1:
+                        hit_tp1 = True
+                        sl_current = entry_ref
+                    if i >= 2:
+                        return (f"TP{i}", float(i), idx.to_pydatetime(), tp)
+
+            if hi >= sl_current:
+                if hit_tp1 and sl_current == entry_ref:
+                    return ("BE", 0.0, idx.to_pydatetime(), entry_ref)
+                return ("SL", -1.0, idx.to_pydatetime(), sl_current)
+
+    return ("EOD", 0.0, None, None)
+
+
+def run_backtest():
+    print("===== BACKTEST RESULTS (REGIME-AWARE ZONES ENGINE) =====")
+    print(f"Symbol: {SYMBOL}")
+    print(f"From:   {DATE_FROM}")
+    print(f"To:     {DATE_TO}")
+    print(f"HTF:    {HTF_TF} | Trigger: {TRIGGER_TF}")
+    print(f"Regime: {REGIME_MODE} (TF={REGIME_TF})")
+    print()
+
+    mt5_init()
+    try:
+        dt_from = datetime.fromisoformat(DATE_FROM).replace(tzinfo=timezone.utc)
+        dt_to = datetime.fromisoformat(DATE_TO).replace(tzinfo=timezone.utc)
+
+        df_tr = mt5_rates_range(SYMBOL, tf_to_mt5(TRIGGER_TF), dt_from, dt_to)
+        df_htf = mt5_rates_range(SYMBOL, tf_to_mt5(HTF_TF), dt_from, dt_to)
+
+        eng = Engine()
+
+        trades: List[Dict[str, Any]] = []
+        last_sig_time: Optional[datetime] = None
+        cooldown = timedelta(minutes=COOLDOWN_MINUTES)
+
+        for i in range(200, len(df_tr) - 60):
+            t = df_tr.index[i].to_pydatetime()
+
+            if last_sig_time is not None and (t - last_sig_time) < cooldown:
+                continue
+
+            htf_slice = df_htf.loc[: df_tr.index[i]]
+            if len(htf_slice) < 100:
+                continue
+            zones = eng.compute_zones(htf_slice)
+            if not zones:
+                continue
+
+            regime, trend_dir, regime_conf = eng.classify_regime(htf_slice)
+
+            recent_window = df_tr.iloc[max(0, i - TRIGGER_LOOKBACK_BARS + 1) : i + 1]
+
+            sig = None
+            for j in range(len(recent_window) - 1, -1, -1):
+                bar = recent_window.iloc[j]
+                zones_sorted = sorted(zones, key=lambda z: abs(((z["low"] + z["high"]) / 2) - float(bar["close"])))
+                for z in zones_sorted:
+                    allow_prox = (regime != "VOLATILE")
+                    side = eng._rejection_trigger(z, bar, allow_proximity=allow_prox)
+                    if side is None:
+                        continue
+
+                    if regime == "TREND" and TREND_ONLY_WITH_EMA and trend_dir in ("BULL", "BEAR"):
+                        if trend_dir == "BULL" and side != "BUY":
+                            continue
+                        if trend_dir == "BEAR" and side != "SELL":
+                            continue
+                        if trend_dir == "BULL" and z.get("kind") != "DEMAND":
+                            continue
+                        if trend_dir == "BEAR" and z.get("kind") != "SUPPLY":
+                            continue
+
+                        pull_min = float(max(0.0, TREND_MIN_PULLBACK_USD))
+                        if pull_min > 0:
+                            if side == "BUY":
+                                depth = float(z["high"]) - float(bar["low"])
+                                if depth < pull_min:
+                                    continue
+                            else:
+                                depth = float(bar["high"]) - float(z["low"])
+                                if depth < pull_min:
+                                    continue
+
+                    if regime == "VOLATILE":
+                        strength_tmp = eng._signal_strength(side, z, bar)
+                        if strength_tmp < 0.55:
+                            continue
+
+                    zkey = eng._zone_reentry_key(z, side)
+                    lastz = eng.zone_last_fired.get(zkey)
+                    if lastz is not None and (t - lastz).total_seconds() / 60.0 < REENTRY_MINUTES:
+                        continue
+
+                    zone_low, zone_high = int(z["low"]), int(z["high"])
+                    entry_ref = round_int((zone_low + zone_high) / 2)
+                    strength = eng._signal_strength(side, z, bar)
+                    sl = eng._make_sl(side, zone_low, zone_high, strength)
+                    tps = eng._tp_ladder(side, entry_ref, strength)
+                    sig = Signal(
+                        time=t,
+                        symbol=SYMBOL,
+                        side=side,
+                        zone_low=zone_low,
+                        zone_high=zone_high,
+                        sl=sl,
+                        tps=tps,
+                        regime=regime,
+                        trend_dir=trend_dir,
+                        regime_conf=float(regime_conf),
+                        be_after_tp1=True,
+                        zone_id=z["id"],
+                    )
+                    eng.zone_last_fired[zkey] = t
+                    break
+                if sig is not None:
+                    break
+
+            if sig is None:
+                continue
+
+            forward = df_tr.iloc[i + 1 : i + 1 + 60]
+            outcome, r_mult, exit_time, exit_price = simulate_trade_path(
+                side=sig.side,
+                entry_ref=round_int((sig.zone_low + sig.zone_high) / 2),
+                sl=sig.sl,
+                tps=sig.tps,
+                df_forward=forward,
+                be_after_tp1=True,
+            )
+
+            trades.append(
+                {
+                    "entry_time": t,
+                    "side": sig.side,
+                    "entry": round_int((sig.zone_low + sig.zone_high) / 2),
+                    "zone_low": sig.zone_low,
+                    "zone_high": sig.zone_high,
+                    "sl": sig.sl,
+                    "tp1": sig.tps[0] if len(sig.tps) > 0 else None,
+                    "tp2": sig.tps[1] if len(sig.tps) > 1 else None,
+                    "tp3": sig.tps[2] if len(sig.tps) > 2 else None,
+                    "tp4": sig.tps[3] if len(sig.tps) > 3 else None,
+                    "outcome": outcome,
+                    "result_r": r_mult,
+                    "exit_time": exit_time,
+                    "exit_price": exit_price,
+                    "zone_id": sig.zone_id,
+                    "regime": sig.regime,
+                    "trend_dir": sig.trend_dir,
+                    "regime_conf": sig.regime_conf,
+                }
+            )
+
+            last_sig_time = t
+
+        if not trades:
+            print("No trades.")
+            return
+
+        dftrades = pd.DataFrame(trades)
+
+        def summarize(dfsub: pd.DataFrame, title: str):
+            n = len(dfsub)
+            win = float((dfsub["result_r"] > 0).mean() * 100.0)
+            avg = float(dfsub["result_r"].mean())
+            pos = dfsub.loc[dfsub["result_r"] > 0, "result_r"].sum()
+            neg = -dfsub.loc[dfsub["result_r"] < 0, "result_r"].sum()
+            pfr = float(pos / neg) if neg > 0 else float("inf")
+            eq = dfsub["result_r"].cumsum()
+            dd = (eq - eq.cummax()).min()
+            print(f"--- {title} ---")
+            print(f"Trades: {n} | Winrate: {win:.2f}% | PF(R): {pfr:.2f} | AvgR: {avg:.2f} | MaxDD(R): {dd:.2f}")
+            print(dfsub["outcome"].value_counts().to_string())
+            print()
+
+        summarize(dftrades, "ALL (REGIME-AWARE)")
+
+        print("Last 10 trades:")
+        cols = [
+            "entry_time",
+            "side",
+            "entry",
+            "sl",
+            "tp1",
+            "tp2",
+            "tp3",
+            "tp4",
+            "outcome",
+            "exit_time",
+            "exit_price",
+            "result_r",
+            "zone_id",
+            "regime",
+            "trend_dir",
+            "regime_conf",
+        ]
+        print(dftrades[cols].tail(10).to_string(index=False))
+        print()
+
+        if BACKTEST_CSV:
+            dftrades.to_csv(BACKTEST_CSV, index=False)
+            print(f"Saved CSV: {BACKTEST_CSV}")
+
+    finally:
+        mt5_shutdown()
+
+
+# =========================
+# FastAPI server
+# =========================
+app = FastAPI()
+engine = Engine()
+
+
+def _to_bool(v: Any) -> bool:
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _to_env_bool(v: bool) -> str:
+    return "1" if bool(v) else "0"
+
+
+SETTINGS_SCHEMA: Dict[str, Any] = {
+    "SYMBOL": str,
+    "DISPLAY_SYMBOL": str,
+    "HTF_TF": str,
+    "TRIGGER_TF": str,
+    "TRIGGER_LOOKBACK_BARS": int,
+    "RECHECK_SAME_BAR": _to_bool,
+    "ENABLE_PROXIMITY_TRIGGER": _to_bool,
+    "TRIGGER_PROXIMITY_USD": float,
+    "CONTINUATION_MIN_BODY_RATIO": float,
+    "ZONE_MAX_USD": float,
+    "SL_BASE_USD": float,
+    "SL_MAX_USD": float,
+    "TP_STEP_USD": float,
+    "SWING_LOOKBACK": int,
+    "ZONES_KEEP": int,
+    "USE_DEVELOPING_ZONES": _to_bool,
+    "DEVELOPING_LOOKBACK_HTF": int,
+    "ZONE_MERGE_TOL_USD": float,
+    "COOLDOWN_MINUTES": int,
+    "MIN_BARS_BETWEEN_SIGNALS": int,
+    "REENTRY_MINUTES": int,
+    "STATUS_LOG_MINUTES": int,
+    "REGIME_MODE": str,
+    "REGIME_TF": str,
+    "REGIME_ADX_PERIOD": int,
+    "REGIME_ATR_PERIOD": int,
+    "REGIME_EMA_FAST": int,
+    "REGIME_EMA_SLOW": int,
+    "REGIME_TREND_ADX_MIN": float,
+    "REGIME_RANGE_ADX_MAX": float,
+    "REGIME_VOL_ATR_MULT": float,
+    "TREND_ONLY_WITH_EMA": _to_bool,
+    "TREND_MIN_PULLBACK_USD": float,
+    "MIN_OPPOSITE_GAP_MINUTES": int,
+    "SHOW_REGIME_INFO": _to_bool,
+}
+
+
+def _setting_to_text(key: str, value: Any) -> str:
+    caster = SETTINGS_SCHEMA.get(key)
+    if caster is _to_bool:
+        return _to_env_bool(bool(value))
+    return str(value)
+
+
+def _write_env_value(key: str, value_text: str, env_path: str = ".env") -> None:
+    lines: List[str] = []
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        lines = []
+
+    key_eq = f"{key}="
+    replaced = False
+    for i, line in enumerate(lines):
+        if line.strip().startswith(key_eq):
+            lines[i] = f"{key}={value_text}\n"
+            replaced = True
+            break
+
+    if not replaced:
+        lines.append(f"{key}={value_text}\n")
+
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+
+def _apply_runtime_setting(key: str, raw_value: str) -> Tuple[bool, str]:
+    if key not in SETTINGS_SCHEMA:
+        return False, "unknown setting"
+
+    caster = SETTINGS_SCHEMA[key]
+    text = str(raw_value).strip()
+
+    if caster is str:
+        value = text
+        if key in ("HTF_TF", "TRIGGER_TF", "REGIME_TF", "REGIME_MODE"):
+            value = value.upper()
+    else:
+        value = caster(text)
+
+    globals()[key] = value
+    os.environ[key] = _setting_to_text(key, value)
+    _write_env_value(key, os.environ[key])
+    return True, "ok"
+
+
+@app.get("/panel", response_class=HTMLResponse)
+def panel() -> HTMLResponse:
+    rows = []
+    for key in SETTINGS_SCHEMA.keys():
+        val = _setting_to_text(key, globals().get(key, os.getenv(key, "")))
+        rows.append(
+            f"<tr><td style='padding:6px 10px'><code>{key}</code></td>"
+            f"<td style='padding:6px 10px'><input name='{key}' value='{val}' style='width:260px'/></td></tr>"
+        )
+
+    html = (
+        "<html><body style='font-family:Arial,sans-serif'>"
+        "<h2>XAU Engine Settings Panel</h2>"
+        "<p>Save után a legtöbb beállítás azonnal frissül a futó processzben, és mentődik a .env-be is.</p>"
+        "<form method='post' action='/panel/save'>"
+        "<table border='1' cellspacing='0' cellpadding='0'>"
+        + "".join(rows)
+        + "</table><br/><button type='submit'>Save settings</button></form>"
+        "</body></html>"
+    )
+    return HTMLResponse(content=html)
+
+
+@app.post("/panel/save", response_class=HTMLResponse)
+async def panel_save(req: Request) -> HTMLResponse:
+    raw_body = (await req.body()).decode("utf-8", errors="ignore")
+    kv: Dict[str, str] = {}
+    for pair in raw_body.split("&"):
+        if not pair:
+            continue
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+        else:
+            k, v = pair, ""
+        k = requests.utils.unquote(k.replace("+", " "))
+        v = requests.utils.unquote(v.replace("+", " "))
+        kv[k] = v
+
+    results = []
+    for key in SETTINGS_SCHEMA.keys():
+        if key not in kv:
+            continue
+        raw = str(kv.get(key, "")).strip()
+        try:
+            ok, msg = _apply_runtime_setting(key, raw)
+            status = "OK" if ok else "SKIP"
+            results.append(f"{status}: {key}={raw} ({msg})")
+        except Exception as e:
+            results.append(f"ERR: {key}={raw} ({e})")
+
+    html = (
+        "<html><body style='font-family:Arial,sans-serif'><h3>Save result</h3><pre>"
+        + "\n".join(results)
+        + "</pre><a href='/panel'>Back</a></body></html>"
+    )
+    return HTMLResponse(content=html)
+
+
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "mode": MODE,
+        "symbol": SYMBOL,
+        "htf": HTF_TF,
+        "trigger": TRIGGER_TF,
+        "regime_mode": REGIME_MODE,
+        "regime_tf": REGIME_TF,
+    }
+
+
+@app.post("/signal")
+async def signal_now():
+    mt5_init()
+    try:
+        sig = engine.generate_signal(SYMBOL)
+        if sig is None:
+            return {"ok": True, "signal": None}
+        msg = format_signal_message(sig)
+        telegram_send(msg)
+        return {
+            "ok": True,
+            "signal": {
+                "side": sig.side,
+                "zone_low": sig.zone_low,
+                "zone_high": sig.zone_high,
+                "sl": sig.sl,
+                "tps": sig.tps,
+                "regime": sig.regime,
+                "trend_dir": sig.trend_dir,
+                "regime_conf": sig.regime_conf,
+                "zone_id": sig.zone_id,
+            },
+        }
+    finally:
+        mt5_shutdown()
+
+
+@app.post("/tv")
+async def tv_webhook(req: Request):
+    try:
+        data = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Bad secret")
+
+    side = str(data.get("side", "")).upper()
+    if side not in ("BUY", "SELL"):
+        raise HTTPException(status_code=400, detail="Missing side")
+
+    def to_int(v):
+        if v is None:
+            return None
+        return round_int(float(v))
+
+    zone_low = to_int(data.get("zone_low")) or 0
+    zone_high = to_int(data.get("zone_high")) or 0
+    sl = to_int(data.get("sl")) or 0
+
+    tps: List[Optional[int]] = []
+    for k in ["tp1", "tp2", "tp3", "tp4"]:
+        if k in data:
+            v = data.get(k)
+            if v is None:
+                tps.append(None)
+            else:
+                if isinstance(v, str) and "HOLD" in v.upper():
+                    tps.append(None)
+                else:
+                    tps.append(to_int(v))
+
+    sig = Signal(
+        time=now_utc(),
+        symbol=SYMBOL,
+        side=side,
+        zone_low=zone_low,
+        zone_high=zone_high,
+        sl=sl,
+        tps=tps if tps else [None],
+        regime="TV",
+        trend_dir="",
+        regime_conf=0.0,
+        be_after_tp1=True,
+        zone_id="TV",
+    )
+    msg = format_signal_message(sig)
+    telegram_send(msg)
+    return {"ok": True}
+
+
+def live_loop():
+    print(f"[LIVE] REGIME-AWARE Bari ZONES engine starting for {SYMBOL} (display {DISPLAY_SYMBOL})")
+    print(f"      HTF={HTF_TF}  Trigger={TRIGGER_TF}  LookbackBars={TRIGGER_LOOKBACK_BARS}  RecheckSameBar={int(RECHECK_SAME_BAR)}")
+    print(f"      RegimeMode={REGIME_MODE} RegimeTF={REGIME_TF} TrendADX>={REGIME_TREND_ADX_MIN} RangeADX<={REGIME_RANGE_ADX_MAX} VolATRx>={REGIME_VOL_ATR_MULT}")
+    print(f"      ProximityTrigger={int(ENABLE_PROXIMITY_TRIGGER)} Proximity={TRIGGER_PROXIMITY_USD}$ MinBodyRatio={CONTINUATION_MIN_BODY_RATIO}")
+    print(f"      ZoneMax={ZONE_MAX_USD}$  SLbase={SL_BASE_USD}$  SLmax={SL_MAX_USD}$  TPstep={TP_STEP_USD}$  Cooldown={COOLDOWN_MINUTES}m OppGap={MIN_OPPOSITE_GAP_MINUTES}m")
+    while True:
+        try:
+            mt5_init()
+            try:
+                sig = engine.generate_signal(SYMBOL)
+                if sig is not None:
+                    msg = format_signal_message(sig)
+                    print("\n" + msg + "\n")
+                    telegram_send(msg)
+                else:
+                    now = now_utc()
+                    should_log = (
+                        engine.last_status_log_time is None
+                        or (now - engine.last_status_log_time).total_seconds() >= max(30, STATUS_LOG_MINUTES * 60)
+                    )
+                    if should_log:
+                        last_bar = engine.last_seen_trigger_bar_time
+                        last_bar_s = last_bar.isoformat() if last_bar is not None else "n/a"
+                        last_sig = engine.last_signal_time
+                        last_sig_s = last_sig.isoformat() if last_sig is not None else "none_yet"
+                        reason = engine.last_no_signal_reason
+                        scan_reason = engine.last_scan_reason
+                        print(f"[LIVE] heartbeat: running, no new signal | reason={reason} | last_scan={scan_reason} | last_trigger_bar={last_bar_s} | last_signal={last_sig_s}")
+                        engine.last_status_log_time = now
+            finally:
+                mt5_shutdown()
+        except Exception as e:
+            print(f"[LIVE] error: {e}")
+        time.sleep(15)
+
+
+if __name__ == "__main__":
+    if MODE == "BACKTEST":
+        run_backtest()
+    else:
+        if os.getenv("LIVE_LOOP", "1") == "1":
+            live_loop()
+        else:
+            if not FASTAPI_AVAILABLE:
+                raise RuntimeError("FastAPI is required for API/panel mode. Install with: pip install fastapi uvicorn")
+            import uvicorn
+            uvicorn.run(app, host="127.0.0.1", port=int(os.getenv("PORT", "8001")))
