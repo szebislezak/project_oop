@@ -1,0 +1,191 @@
+//@version=5
+indicator("SwingSpot OP Final", overlay=true, max_bars_back=1000, max_labels_count=500)
+
+//══════════════════════════════════════════
+// INPUTS
+//══════════════════════════════════════════
+groupTrend = "Trend"
+emaFastLen = input.int(21, "EMA Fast", minval=1, group=groupTrend)
+emaMidLen  = input.int(55, "EMA Mid", minval=1, group=groupTrend)
+emaSlowLen = input.int(200, "EMA Slow", minval=1, group=groupTrend)
+htfTf      = input.timeframe("240", "Higher Timeframe", group=groupTrend)
+useHtf     = input.bool(true, "Use HTF filter", group=groupTrend)
+
+ groupMom = "Momentum"
+rsiLen      = input.int(14, "RSI Length", minval=2, group=groupMom)
+rsiSignal   = input.int(5, "RSI Signal SMA", minval=2, group=groupMom)
+adxLen      = input.int(14, "ADX Length", minval=2, group=groupMom)
+adxMin      = input.float(18.0, "Minimum ADX", minval=1, step=0.5, group=groupMom)
+
+ groupVol = "Volume / Volatility"
+useVolFilter = input.bool(true, "Use volume filter", group=groupVol)
+volLen       = input.int(20, "Volume SMA Length", minval=1, group=groupVol)
+volMult      = input.float(1.1, "Volume multiplier", minval=0.1, step=0.1, group=groupVol)
+atrLen       = input.int(14, "ATR Length", minval=1, group=groupVol)
+minSpreadAtr = input.float(0.25, "Min EMA spread vs ATR", minval=0.0, step=0.05, group=groupVol)
+
+ groupEntry = "Entry Logic"
+pullbackLookback = input.int(6, "Pullback lookback bars", minval=1, maxval=30, group=groupEntry)
+reclaimLookback  = input.int(3, "Reclaim / rejection bars", minval=1, maxval=10, group=groupEntry)
+scoreToTrigger   = input.int(6, "Min score for signal", minval=3, maxval=10, group=groupEntry)
+cooldownBars     = input.int(8, "Cooldown bars between same signals", minval=0, maxval=100, group=groupEntry)
+
+ groupVis = "Visual"
+showDashboard = input.bool(true, "Show dashboard", group=groupVis)
+showEmas      = input.bool(true, "Show EMAs", group=groupVis)
+showBgBias    = input.bool(false, "Background bias", group=groupVis)
+
+//══════════════════════════════════════════
+// CORE SERIES
+//══════════════════════════════════════════
+emaFast = ta.ema(close, emaFastLen)
+emaMid  = ta.ema(close, emaMidLen)
+emaSlow = ta.ema(close, emaSlowLen)
+
+rsi   = ta.rsi(close, rsiLen)
+rsiMa = ta.sma(rsi, rsiSignal)
+atr   = ta.atr(atrLen)
+volMa = ta.sma(volume, volLen)
+
+plusDI  = ta.diplus(adxLen)
+minusDI = ta.diminus(adxLen)
+adx     = ta.adx(adxLen)
+
+htfEmaFast = request.security(syminfo.tickerid, htfTf, ta.ema(close, emaFastLen))
+htfEmaMid  = request.security(syminfo.tickerid, htfTf, ta.ema(close, emaMidLen))
+htfBull    = htfEmaFast > htfEmaMid
+htfBear    = htfEmaFast < htfEmaMid
+
+//══════════════════════════════════════════
+// MARKET STATE
+//══════════════════════════════════════════
+bullTrend = emaFast > emaMid and emaMid > emaSlow
+bearTrend = emaFast < emaMid and emaMid < emaSlow
+
+emaSpread = math.abs(emaFast - emaMid)
+trendStrong = emaSpread > atr * minSpreadAtr and adx >= adxMin
+volOk = not useVolFilter or volume > volMa * volMult
+
+recentTouchLong  = ta.lowest(low, pullbackLookback) <= emaFast or ta.lowest(low, pullbackLookback) <= emaMid
+recentTouchShort = ta.highest(high, pullbackLookback) >= emaFast or ta.highest(high, pullbackLookback) >= emaMid
+
+bullCandle = close > open
+bearCandle = close < open
+
+reclaimLong = close > emaFast and ta.highest(close, reclaimLookback) == close
+rejectShort = close < emaFast and ta.lowest(close, reclaimLookback) == close
+
+rsiBull = rsi > rsiMa and rsi > 50 and rsi > rsi[1]
+rsiBear = rsi < rsiMa and rsi < 50 and rsi < rsi[1]
+
+diBull = plusDI > minusDI
+diBear = minusDI > plusDI
+
+aboveSlow = close > emaSlow
+belowSlow = close < emaSlow
+
+htfLongOk = not useHtf or htfBull
+htfShortOk = not useHtf or htfBear
+
+//══════════════════════════════════════════
+// SCORE ENGINE
+//══════════════════════════════════════════
+longScore = 0
+longScore += bullTrend ? 2 : 0
+longScore += htfLongOk ? 1 : 0
+longScore += trendStrong ? 1 : 0
+longScore += recentTouchLong ? 1 : 0
+longScore += reclaimLong ? 1 : 0
+longScore += rsiBull ? 1 : 0
+longScore += diBull ? 1 : 0
+longScore += bullCandle ? 1 : 0
+longScore += aboveSlow ? 1 : 0
+longScore += volOk ? 1 : 0
+
+shortScore = 0
+shortScore += bearTrend ? 2 : 0
+shortScore += htfShortOk ? 1 : 0
+shortScore += trendStrong ? 1 : 0
+shortScore += recentTouchShort ? 1 : 0
+shortScore += rejectShort ? 1 : 0
+shortScore += rsiBear ? 1 : 0
+shortScore += diBear ? 1 : 0
+shortScore += bearCandle ? 1 : 0
+shortScore += belowSlow ? 1 : 0
+shortScore += volOk ? 1 : 0
+
+baseBuy  = longScore >= scoreToTrigger and bullTrend and htfLongOk and trendStrong and recentTouchLong and reclaimLong and rsiBull
+baseSell = shortScore >= scoreToTrigger and bearTrend and htfShortOk and trendStrong and recentTouchShort and rejectShort and rsiBear
+
+var int lastBuyBar = na
+var int lastSellBar = na
+
+buySignal = baseBuy and (na(lastBuyBar) or bar_index - lastBuyBar > cooldownBars)
+sellSignal = baseSell and (na(lastSellBar) or bar_index - lastSellBar > cooldownBars)
+
+if buySignal
+    lastBuyBar := bar_index
+if sellSignal
+    lastSellBar := bar_index
+
+//══════════════════════════════════════════
+// VISUALS
+//══════════════════════════════════════════
+plot(showEmas ? emaFast : na, "EMA Fast", color=color.new(color.aqua, 0), linewidth=2)
+plot(showEmas ? emaMid : na, "EMA Mid", color=color.new(color.orange, 0), linewidth=2)
+plot(showEmas ? emaSlow : na, "EMA Slow", color=color.new(color.white, 25), linewidth=2)
+
+bgcolor(showBgBias ? bullTrend and htfLongOk ? color.new(color.green, 92) : bearTrend and htfShortOk ? color.new(color.red, 92) : na : na)
+
+plotshape(buySignal, title="BUY", style=shape.labelup, location=location.belowbar, color=color.new(color.lime, 0), text="BUY", textcolor=color.white, size=size.normal)
+plotshape(sellSignal, title="SELL", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), text="SELL", textcolor=color.white, size=size.normal)
+
+//══════════════════════════════════════════
+// DASHBOARD
+//══════════════════════════════════════════
+var table dash = table.new(position.top_right, 2, 9, bgcolor=color.new(color.rgb(43, 47, 120), 8), border_width=1)
+
+trendTxt = bullTrend ? "BULLISH" : bearTrend ? "BEARISH" : "RANGE"
+trendCol = bullTrend ? color.lime : bearTrend ? color.red : color.silver
+htfTxt = htfBull ? "LONG" : htfBear ? "SHORT" : "NEUTRAL"
+htfCol = htfBull ? color.lime : htfBear ? color.red : color.silver
+momTxt = rsiBull ? "UP" : rsiBear ? "DOWN" : "FLAT"
+momCol = rsiBull ? color.lime : rsiBear ? color.red : color.silver
+stratTxt = buySignal ? "BUY" : sellSignal ? "SELL" : longScore > shortScore ? "LONG BIAS" : shortScore > longScore ? "SHORT BIAS" : "WAIT"
+stratCol = buySignal ? color.lime : sellSignal ? color.red : color.yellow
+volTxt = volOk ? "OK" : "LOW"
+volCol = volOk ? color.lime : color.orange
+
+if barstate.islast and showDashboard
+    table.cell(dash, 0, 0, "SWINGSPOT OP", text_color=color.white, bgcolor=color.new(color.blue, 10), text_halign=text.align_center)
+    table.cell(dash, 1, 0, "FINAL", text_color=color.white, bgcolor=color.new(color.blue, 10), text_halign=text.align_center)
+
+    table.cell(dash, 0, 1, "TREND", text_color=color.white)
+    table.cell(dash, 1, 1, trendTxt, text_color=trendCol)
+
+    table.cell(dash, 0, 2, "HTF", text_color=color.white)
+    table.cell(dash, 1, 2, htfTxt, text_color=htfCol)
+
+    table.cell(dash, 0, 3, "RSI", text_color=color.white)
+    table.cell(dash, 1, 3, str.tostring(math.round(rsi, 1)), text_color=color.yellow)
+
+    table.cell(dash, 0, 4, "MOMENTUM", text_color=color.white)
+    table.cell(dash, 1, 4, momTxt, text_color=momCol)
+
+    table.cell(dash, 0, 5, "ADX", text_color=color.white)
+    table.cell(dash, 1, 5, str.tostring(math.round(adx, 1)), text_color=adx >= adxMin ? color.lime : color.orange)
+
+    table.cell(dash, 0, 6, "VOLUME", text_color=color.white)
+    table.cell(dash, 1, 6, volTxt, text_color=volCol)
+
+    table.cell(dash, 0, 7, "SCORE", text_color=color.white)
+    table.cell(dash, 1, 7, "L " + str.tostring(longScore) + " / S " + str.tostring(shortScore), text_color=color.white)
+
+    table.cell(dash, 0, 8, "SETUP", text_color=color.white)
+    table.cell(dash, 1, 8, stratTxt, text_color=stratCol)
+
+//══════════════════════════════════════════
+// ALERTS
+//══════════════════════════════════════════
+alertcondition(buySignal, "SwingSpot BUY", "BUY signal on {{ticker}} {{interval}}")
+alertcondition(sellSignal, "SwingSpot SELL", "SELL signal on {{ticker}} {{interval}}")
